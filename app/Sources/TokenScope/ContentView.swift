@@ -1,0 +1,316 @@
+import SwiftUI
+
+struct ContentView: View {
+    @StateObject private var viewModel = StatsViewModel()
+
+    var body: some View {
+        VStack(spacing: 0) {
+            header
+            Divider()
+            statsCards
+            Divider()
+            breakdownList
+            Divider()
+            footer
+        }
+        .frame(width: 560, height: 500)
+        .background(Color(nsColor: .windowBackgroundColor))
+        .onAppear { viewModel.startAutoRefresh() }
+        .onDisappear { viewModel.stopAutoRefresh() }
+    }
+
+    // MARK: - 顶部
+
+    private var header: some View {
+        HStack(alignment: .top) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("今日真实消耗 Tokens")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text(formatNumber(viewModel.summary.realConsumedTokens))
+                        .font(.system(size: 30, weight: .bold, design: .rounded))
+                    Text("不含缓存读取")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+                Text("总 token \(formatTokenCount(viewModel.summary.totalTokens))　·　计费等效 \(formatTokenCount(Int64(viewModel.summary.billableTokens)))")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer()
+
+            VStack(alignment: .trailing, spacing: 5) {
+                statBadge(
+                    icon: "arrow.left.arrow.right",
+                    label: "请求数",
+                    value: viewModel.summary.failedCount > 0
+                        ? "\(viewModel.summary.requestCount)  (失败 \(viewModel.summary.failedCount))"
+                        : "\(viewModel.summary.requestCount)",
+                    color: viewModel.summary.failedCount > 0 ? .orange : .blue
+                )
+                statBadge(
+                    icon: "timer",
+                    label: "首字延迟 P50",
+                    value: formatDuration(viewModel.summary.ttftP50),
+                    color: .teal
+                )
+                statBadge(
+                    icon: "clock",
+                    label: "耗时 P50 / P95",
+                    value: "\(formatDuration(viewModel.summary.durationP50)) / \(formatDuration(viewModel.summary.durationP95))",
+                    color: .indigo
+                )
+            }
+        }
+        .padding(16)
+    }
+
+    private func statBadge(icon: String, label: String, value: String, color: Color) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: icon).font(.caption2).foregroundStyle(color).frame(width: 14)
+            VStack(alignment: .leading, spacing: 0) {
+                Text(label).font(.caption2).foregroundStyle(.secondary)
+                Text(value).font(.caption).fontWeight(.semibold)
+            }
+        }
+    }
+
+    // MARK: - 指标卡
+
+    private var statsCards: some View {
+        VStack(spacing: 10) {
+            HStack(spacing: 10) {
+                statCard(icon: "arrow.down.circle", color: .blue,
+                         title: "新增输入", value: formatTokenCount(viewModel.summary.newInputTokens))
+                statCard(icon: "bolt.horizontal.circle", color: .green,
+                         title: "缓存读取", value: formatTokenCount(viewModel.summary.cachedTokens))
+                statCard(icon: "square.and.arrow.down.on.square", color: .orange,
+                         title: "缓存写入", value: formatTokenCount(viewModel.summary.cacheCreationTokens))
+                statCard(icon: "arrow.up.circle", color: .purple,
+                         title: "输出", value: formatTokenCount(viewModel.summary.outputTokens))
+            }
+            cacheHitCard
+        }
+        .padding(EdgeInsets(top: 12, leading: 16, bottom: 12, trailing: 16))
+    }
+
+    private func statCard(icon: String, color: Color, title: String, value: String) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 4) {
+                Image(systemName: icon).font(.caption2).foregroundStyle(color)
+                Text(title).font(.caption2).foregroundStyle(.secondary)
+            }
+            Text(value).font(.callout).fontWeight(.semibold)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(9)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color(nsColor: .controlBackgroundColor)))
+    }
+
+    private var cacheHitCard: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 6) {
+                Image(systemName: "bolt.fill").font(.caption2).foregroundStyle(.yellow)
+                Text("缓存命中率").font(.caption2).foregroundStyle(.secondary)
+
+                Text("Σ缓存读 / Σ真实总输入")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+
+                Spacer()
+
+                Text("\(formatTokenCount(viewModel.summary.cachedTokens)) / \(formatTokenCount(viewModel.summary.hitRateDenominator))")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Text(String(format: "%.1f%%", viewModel.summary.cacheHitRate))
+                    .font(.caption).fontWeight(.bold)
+                    .foregroundStyle(hitRateColor(viewModel.summary.cacheHitRate))
+            }
+            ProgressView(value: min(viewModel.summary.cacheHitRate, 100), total: 100)
+                .tint(hitRateColor(viewModel.summary.cacheHitRate))
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(9)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color(nsColor: .controlBackgroundColor)))
+    }
+
+    /// 命中率配色阈值。
+    ///
+    /// 阈值按“分母含缓存写入”的口径设定：该口径下建缓存的开销也计入分母，
+    /// 数值天然低于 new-api 那种口径（实测同一份数据 65% vs 98%），
+    /// 因此 60% 已属良好，不能沿用 80/50 那套阈值。
+    private func hitRateColor(_ rate: Double) -> Color {
+        if rate >= 60 { return .green }
+        if rate >= 30 { return .orange }
+        return .red
+    }
+
+    // MARK: - 分组明细
+
+    private var breakdownList: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Picker("", selection: $viewModel.dimension) {
+                    ForEach(GroupDimension.allCases) { dim in
+                        Text(dim.rawValue).tag(dim)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .frame(width: 130)
+                .labelsHidden()
+
+                Spacer()
+
+                if viewModel.isLoading {
+                    ProgressView().controlSize(.small)
+                }
+                Button { viewModel.refresh() } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .buttonStyle(.plain)
+                .help("立即刷新")
+            }
+            .padding(EdgeInsets(top: 10, leading: 16, bottom: 8, trailing: 16))
+
+            if viewModel.snapshot.isEmpty {
+                VStack(spacing: 6) {
+                    Image(systemName: "tray").font(.title2).foregroundStyle(.tertiary)
+                    Text("今日暂无数据").font(.caption).foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, minHeight: 120)
+            } else {
+                ScrollView {
+                    VStack(spacing: 0) {
+                        ForEach(viewModel.rows) { row in
+                            rowView(row)
+                            if row.id != viewModel.rows.last?.id { Divider() }
+                        }
+                    }
+                }
+                .frame(maxHeight: 210)
+            }
+        }
+    }
+
+    private func rowView(_ row: StatsRow) -> some View {
+        HStack(spacing: 8) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(row.name)
+                    .font(.caption).fontWeight(.medium)
+                    .lineLimit(1).truncationMode(.middle)
+                HStack(spacing: 4) {
+                    Text("\(row.requestCount) 次")
+                        .font(.caption2).foregroundStyle(.secondary)
+                    if row.failedCount > 0 {
+                        Text("失败 \(row.failedCount)")
+                            .font(.caption2).foregroundStyle(.red)
+                    }
+                }
+            }
+            .frame(width: 132, alignment: .leading)
+
+            // token 分解
+            VStack(alignment: .leading, spacing: 2) {
+                tokenLine(icon: "arrow.down", color: .blue, value: row.newInputTokens)
+                tokenLine(icon: "arrow.up", color: .purple, value: row.outputTokens)
+            }
+            .frame(width: 74, alignment: .leading)
+
+            VStack(alignment: .leading, spacing: 2) {
+                tokenLine(icon: "bolt.fill", color: .green, value: row.cachedTokens)
+                if row.cacheCreationTokens > 0 {
+                    tokenLine(icon: "square.and.arrow.down", color: .orange, value: row.cacheCreationTokens)
+                }
+            }
+            .frame(width: 74, alignment: .leading)
+
+            Spacer(minLength: 0)
+
+            // 命中率
+            VStack(alignment: .trailing, spacing: 2) {
+                Text(String(format: "%.1f%%", row.cacheHitRate))
+                    .font(.caption).fontWeight(.semibold)
+                    .foregroundStyle(hitRateColor(row.cacheHitRate))
+                Text("命中率").font(.caption2).foregroundStyle(.tertiary)
+            }
+            .frame(width: 52, alignment: .trailing)
+
+            // 延迟
+            VStack(alignment: .trailing, spacing: 2) {
+                Text(formatDuration(row.ttftP50))
+                    .font(.caption2).foregroundStyle(.teal)
+                Text(formatDuration(row.durationP50))
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+            .frame(width: 56, alignment: .trailing)
+        }
+        .padding(EdgeInsets(top: 7, leading: 16, bottom: 7, trailing: 16))
+        .help("""
+            \(row.name)
+            新增输入 \(formatNumber(row.newInputTokens))
+            缓存读取 \(formatNumber(row.cachedTokens))
+            缓存写入 \(formatNumber(row.cacheCreationTokens))
+            输出 \(formatNumber(row.outputTokens))
+            真实总输入 \(formatNumber(row.totalInputTokens))
+            命中率 \(formatNumber(row.cachedTokens)) / \(formatNumber(row.hitRateDenominator)) = \(String(format: "%.2f%%", row.cacheHitRate))
+            计费等效 \(formatNumber(Int64(row.billableTokens)))
+            首字 P50 \(formatDuration(row.ttftP50))　耗时 P50 \(formatDuration(row.durationP50))
+            """)
+    }
+
+    private func tokenLine(icon: String, color: Color, value: Int64) -> some View {
+        HStack(spacing: 3) {
+            Image(systemName: icon).font(.system(size: 8)).foregroundStyle(color)
+            Text(formatTokenCount(value)).font(.caption2)
+        }
+    }
+
+    // MARK: - 底部
+
+    private var footer: some View {
+        HStack {
+            Text(viewModel.snapshot.dateString)
+                .font(.caption2).foregroundStyle(.tertiary)
+            Spacer()
+            if let refreshed = viewModel.lastRefreshed {
+                Text("更新于 \(timeString(refreshed))")
+                    .font(.caption2).foregroundStyle(.tertiary)
+            }
+            Button("退出") { NSApp.terminate(nil) }
+                .buttonStyle(.plain)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+        .padding(EdgeInsets(top: 7, leading: 16, bottom: 8, trailing: 16))
+    }
+
+    // MARK: - 格式化
+
+    private func formatNumber(_ value: Int64) -> String {
+        let f = NumberFormatter()
+        f.numberStyle = .decimal
+        f.groupingSeparator = ","
+        return f.string(from: NSNumber(value: value)) ?? "\(value)"
+    }
+
+    private func formatTokenCount(_ value: Int64) -> String {
+        if value >= 100_000_000 { return String(format: "%.2f亿", Double(value) / 100_000_000) }
+        if value >= 10_000 { return String(format: "%.1f万", Double(value) / 10_000) }
+        return formatNumber(value)
+    }
+
+    private func formatDuration(_ ms: Int) -> String {
+        if ms <= 0 { return "—" }
+        if ms >= 10_000 { return String(format: "%.0fs", Double(ms) / 1000) }
+        if ms >= 1_000 { return String(format: "%.1fs", Double(ms) / 1000) }
+        return "\(ms)ms"
+    }
+
+    private func timeString(_ date: Date) -> String {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss"
+        return f.string(from: date)
+    }
+}

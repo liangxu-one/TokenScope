@@ -1,0 +1,10 @@
+{
+    "_comment": "复制本文件为 ai_stats_domains.json 并填入真实域名。路径前缀 → 上游域名。",
+    "routes": {
+        "/deepseek": "api.deepseek.com",
+        "/minimax": "api.minimaxi.com",
+        "/openai": "api.openai.com",
+        "/anthropic": "api.anthropic.com",
+        "/custom": "your-gateway.example.com"
+    }
+}

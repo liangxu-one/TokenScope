@@ -1,0 +1,47 @@
+# ── 统计数据（运行时产生，按天生成，不入库）
+ai_stats-*.jsonl
+*.jsonl
+
+# ── 抓包报文（含明文对话内容，绝不入库）
+captures/
+
+# ── Swift 构建产物
+.build/
+*.app/
+*.xcodeproj
+*.xcworkspace
+.swiftpm/
+Package.resolved
+DerivedData/
+
+# ── 图标中间产物（由 make_icons.swift 生成）
+*.iconset/
+
+# ── Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ── 备份与临时文件
+*.bak
+*.migrated
+*.before_fix
+*.log
+*.tmp
+
+# ── macOS
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+
+# ── 编辑器
+.vscode/
+.idea/
+*.swp
+
+# ── 运行时路由配置（含真实域名，本地保留）
+# 参考 proxy/ai_stats_domains.example.json
+proxy/ai_stats_domains.json
