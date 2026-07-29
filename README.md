@@ -63,9 +63,9 @@ python3 http_proxy.py
 
 把 base URL 的域名部分换成 `127.0.0.1:12345/<前缀>`，路径保持不变：
 
-| 原地址 | 改为 |
-|---|---|
-| `https://api.deepseek.com/v1` | `http://127.0.0.1:12345/deepseek/v1` |
+| 原地址                                    | 改为                                             |
+| ----------------------------------------- | ------------------------------------------------ |
+| `https://api.deepseek.com/v1`           | `http://127.0.0.1:12345/deepseek/v1`           |
 | `https://api.deepseek.com/anthropic/v1` | `http://127.0.0.1:12345/deepseek/anthropic/v1` |
 
 > ⚠️ 必须用 `http://` 而非 `https://`。代理是纯 HTTP 服务，
@@ -85,19 +85,19 @@ cd app
 各厂商返回的 usage 字段语义不一致，代理会先做归一化再落盘。
 判断依据**只看输入总量字段名**，与厂商、模型无关：
 
-| 上游字段 | 语义 | 换算 |
-|---|---|---|
-| `input_tokens` | 不含缓存（Anthropic 风格） | `new_input = input_tokens` |
-| `prompt_tokens` | 已含缓存（OpenAI 风格） | `new_input = prompt_tokens - cached` |
+| 上游字段          | 语义                       | 换算                                   |
+| ----------------- | -------------------------- | -------------------------------------- |
+| `input_tokens`  | 不含缓存（Anthropic 风格） | `new_input = input_tokens`           |
+| `prompt_tokens` | 已含缓存（OpenAI 风格）    | `new_input = prompt_tokens - cached` |
 
 落盘后的字段：
 
-| 字段 | 含义 |
-|---|---|
-| `new_input_tokens` | 纯新增输入，不含缓存 |
-| `cached_tokens` | 缓存读取（命中） |
+| 字段                      | 含义                         |
+| ------------------------- | ---------------------------- |
+| `new_input_tokens`      | 纯新增输入，不含缓存         |
+| `cached_tokens`         | 缓存读取（命中）             |
 | `cache_creation_tokens` | 缓存写入（一次性建缓存开销） |
-| `output_tokens` | 输出（含 reasoning） |
+| `output_tokens`         | 输出（含 reasoning）         |
 
 ### 缓存命中率
 
@@ -128,12 +128,12 @@ cd app
 缓存命中率反映不了成本，因为各项 token 的计费倍率差异很大。
 界面上的"计费等效"按 new-api 默认倍率折算：
 
-| 项目 | 倍率 |
-|---|---|
-| 新增输入 | 1.0 |
-| 缓存读取 | 0.1 |
+| 项目     | 倍率                            |
+| -------- | ------------------------------- |
+| 新增输入 | 1.0                             |
+| 缓存读取 | 0.1                             |
 | 缓存写入 | **1.25**（5m）/ 2.0（1h） |
-| 输出 | 1.0 |
+| 输出     | 1.0                             |
 
 实测中缓存写入常占总成本 80% 以上 —— 它是一次性开销但单价最高，
 而缓存读取虽然量大却因 0.1 倍折扣而便宜。
@@ -142,22 +142,22 @@ cd app
 
 Anthropic 协议的 usage 分两个事件下发，各家行为差异很大（实测）：
 
-| 渠道 | `message_start` | `message_delta` |
-|---|---|---|
-| DeepSeek | `input=20837` | `input=20837`（一致） |
-| MiniMax | `input=0` | `input=280` |
-| 阿里云 | `input=24681`（粗估） | `input=6`（真值） |
+| 渠道     | `message_start`       | `message_delta`       |
+| -------- | ----------------------- | ----------------------- |
+| DeepSeek | `input=20837`         | `input=20837`（一致） |
+| MiniMax  | `input=0`             | `input=280`           |
+| 阿里云   | `input=24681`（粗估） | `input=6`（真值）     |
 
 因此 **`message_delta` 是权威终值，直接覆盖**；`message_start` 只用于填补尚为 0 的字段。
 **不能取最大值** —— 否则阿里云的新增输入会被高估上万，命中率被严重低估。
 
 ## 环境变量
 
-| 变量 | 默认 | 说明 |
-|---|---|---|
-| `AI_PROXY_RETENTION_DAYS` | `3` | 统计文件保留天数，`0` 为永久保留 |
-| `AI_PROXY_CAPTURE` | 关闭 | 设为 `1` 记录完整报文到 `proxy/captures/`，用于排查 token 对不上 |
-| `TOKENSCOPE_STATS_DIR` | 自动 | 覆盖统计文件目录，默认从 app 位置推算仓库内的 `proxy/` |
+| 变量                        | 默认  | 说明                                                                |
+| --------------------------- | ----- | ------------------------------------------------------------------- |
+| `AI_PROXY_RETENTION_DAYS` | `3` | 统计文件保留天数，`0` 为永久保留                                  |
+| `AI_PROXY_CAPTURE`        | 关闭  | 设为`1` 记录完整报文到 `proxy/captures/`，用于排查 token 对不上 |
+| `TOKENSCOPE_STATS_DIR`    | 自动  | 覆盖统计文件目录，默认从 app 位置推算仓库内的`proxy/`             |
 
 抓包模式下 `Authorization`、`x-api-key` 等敏感头会自动脱敏，
 但**对话内容是明文**，`captures/` 已在 `.gitignore` 中。

@@ -1073,6 +1073,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def do_PATCH(self):
         self.do_request("PATCH")
 
+    def do_HEAD(self):
+        # 健康检查/探活常用 HEAD。不实现会返回 501，且该请求不会被统计。
+        self.do_request("HEAD")
+
 
 def main():
     setup_logging()
