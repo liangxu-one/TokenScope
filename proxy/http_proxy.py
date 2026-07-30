@@ -255,6 +255,63 @@ def pretty_json(raw):
         return text
 
 
+def decode_for_log(raw, content_encoding):
+    """
+    按 Content-Encoding 解压响应体，**只用于日志与统计记录**。
+
+    代理在 build_upstream_headers 里对每个请求都声明了 Accept-Encoding: gzip, deflate，
+    所以上游连错误响应也会压缩。若不解压就 decode，errors="replace" 会把 gzip 字节
+    不可逆地替换成 U+FFFD——默认模式下 jsonl 的 error 字段是唯一副本，
+    毁了就再也还原不出上游究竟说了什么（限流要等多久、模型名错在哪）。
+
+    与 handle_plain_response 里那段解压刻意不同：这里遇到解不开的编码**不抛异常**。
+    成功路径解压失败意味着 token 统计不准，必须落一条 error 让人知道；
+    错误路径只是想尽量拿到可读文本，拿不到也不该再造一个新错误去掩盖原始报错。
+    """
+    encoding = (content_encoding or "").lower()
+    try:
+        if "gzip" in encoding:
+            return gzip.decompress(raw)
+        if "deflate" in encoding:
+            # 有上游发的是裸 deflate（不带 zlib 头），两种都试一下
+            try:
+                return zlib.decompress(raw)
+            except zlib.error:
+                return zlib.decompress(raw, -zlib.MAX_WBITS)
+    except Exception:
+        # br / zstd 等标准库解不开的编码，或数据本身损坏：原样返回，至少不崩
+        pass
+    return raw
+
+
+def extract_stream_error(event):
+    """
+    从单个 SSE 事件里提取错误描述，没有错误返回 None。
+
+    流式响应的 200 状态头在 body 生成之前就发出去了，上游中途出错时改不了状态码，
+    只能在流里塞一个错误事件。认两种形态：
+
+        Anthropic    {"type":"error","error":{"type":"overloaded_error","message":"..."}}
+        OpenAI 兼容  {"error":{"message":"...","code":"..."}}
+
+    **必须用真值判断而不是 `"error" in event`**：OpenAI 风格的正常 chunk 里常年带着
+    `"error": null`，用 in 判断会把每一条流式请求都标成失败。
+    """
+    err = event.get("error")
+    if not err and (event.get("type") or "") != "error":
+        return None
+
+    if isinstance(err, dict):
+        message = err.get("message") or json.dumps(err, ensure_ascii=False)
+        kind = err.get("type") or err.get("code")
+        return f"{kind}: {message}" if kind else str(message)
+    if err:
+        return str(err)
+
+    # type 是 error 但没有 error 字段：形态不认识，整条留下，别把信息丢了
+    return json.dumps(event, ensure_ascii=False)
+
+
 class Capture:
     """把单次请求的完整报文写成一个易读的文本文件"""
 
@@ -772,12 +829,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 chunked=False,
                 content_length=len(error_body),
             )
+            # 转发给客户端的必须是原始字节（Content-Encoding 头也照原样转发），
+            # 解压只作用于下面记日志用的那份副本
             self.wfile.write(error_body)
             self.wfile.flush()
 
-            detail = error_body.decode("utf-8", errors="replace")[:500]
+            decoded_body = decode_for_log(error_body, e.headers.get("Content-Encoding"))
+            detail = decoded_body.decode("utf-8", errors="replace")[:500]
             if capture:
-                capture.add("上游错误响应", f"status={e.code}\n\n{pretty_json(error_body)}")
+                capture.add("上游错误响应", f"status={e.code}\n\n{pretty_json(decoded_body)}")
                 capture.flush()
 
             self.record(
@@ -902,6 +962,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
         resolved_model = model
         raw_sse = [] if capture else None
         usage_events = [] if capture else None
+        # 与 usage_events 不同，这个列表在非抓包模式下也要收集：
+        # 它是判定这条请求成功还是失败的依据，不是排查用的额外信息。
+        stream_errors = []
         client_gone = False
 
         # read1() 返回当前已到达的数据，不会阻塞等待凑满缓冲区；
@@ -939,6 +1002,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         tokens,
                         api_format,
                         usage_events=usage_events,
+                        stream_errors=stream_errors,
                     )
                     if found:
                         resolved_model = found
@@ -949,6 +1013,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     tokens,
                     api_format,
                     usage_events=usage_events,
+                    stream_errors=stream_errors,
                 )
                 if found:
                     resolved_model = found
@@ -960,6 +1025,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
             if not decompressor.supported:
                 error = f"无法解析的 Content-Encoding: {content_encoding}"
+
+            # 放在最后：上游自己报的错优先级最高。
+            # 上面两种是代理侧/客户端侧的现象，这条是根因，也是唯一能解释
+            # "status=200 却零输出"的信息——没有它这条会落盘成一次干净的成功。
+            if stream_errors:
+                error = "上游流内错误: " + " | ".join(stream_errors)
 
         except (BrokenPipeError, ConnectionResetError):
             error = "客户端提前断开"
@@ -994,10 +1065,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
             error=error,
         )
 
-    def parse_sse_line(self, line, tokens, api_format, usage_events=None):
+    def parse_sse_line(self, line, tokens, api_format, usage_events=None,
+                       stream_errors=None):
         """
         解析单行 SSE 数据，把 usage 合并进 tokens。
         返回响应中声明的 model 名（若有）。
+
+        流内错误通过 stream_errors 这个可变列表带出去，而不是改返回值——
+        返回值的语义是 model 名，两个调用点都按 `if found: resolved_model = found` 用它。
         """
         line = line.strip()
         if not line.startswith("data:"):
@@ -1016,6 +1091,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         event_type = event.get("type") or ""
         model = event.get("model")
+
+        # 错误检查独立于下面那条 usage 的 if/elif 链：有网关会在报错的同一个事件里
+        # 带上已消耗的 usage，两样都得收。去重是防止上游反复推同一条错误把字段撑爆。
+        stream_error = extract_stream_error(event)
+        if stream_error and stream_errors is not None and stream_error not in stream_errors:
+            stream_errors.append(stream_error)
 
         # Anthropic: message_start 的 usage 只是预估，仅用于填补尚为 0 的字段
         if event_type == "message_start":
