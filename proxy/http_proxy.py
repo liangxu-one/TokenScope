@@ -77,6 +77,10 @@ DOMAINS_FILE = os.path.join(SCRIPT_DIR, "ai_stats_domains.json")
 STATS_DIR = SCRIPT_DIR
 STATS_PREFIX = "ai_stats-"
 
+# model 解析不出来时的占位值。record() 用它判断该不该落盘，
+# build_upstream_body() 用它做默认值 —— 两处必须是同一个字符串，所以提到这里。
+UNKNOWN_MODEL = "unknown"
+
 LISTEN_HOST = "127.0.0.1"
 LISTEN_PORT = 12345
 UPSTREAM_TIMEOUT = 300
@@ -618,10 +622,28 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if error:
             stat["error"] = str(error)[:500]
 
-        self.save_stats(stat)
+        # model 解析不出来的记录一律不落盘。
+        #
+        # 主要针对探活请求：Claude Code 会打 /api/hello 这类探测端点，它没有 model、
+        # 也不产生 token，落盘只会让界面上多出一行毫无信息量的 "unknown"。
+        #
+        # 判据**只看 model，不看 token**，这是有意的取舍：理论上"请求体畸形但确实
+        # 消耗了 token"的调用也会被丢掉，总输入会少算一点。选这一边的理由是历史
+        # 711 条里这种记录有 0 条，而多加一个 token 条件就意味着界面上永远还有
+        # 冒出 unknown 的可能。宁可少算那种理论情况。
+        #
+        # 注意真实失败不会被误伤：429、上游超时这类零输出的失败，model 是从请求体里
+        # 拿到的，不是 UNKNOWN_MODEL，照常落盘。
+        #
+        # 只跳过落盘，控制台那行照打（下面会标注"未计入统计"）：/api/hello 返回 401
+        # 恰恰说明 key 有问题，这个信号不能丢，只是它不该进 token 统计。
+        is_unknown = model == UNKNOWN_MODEL
+        if not is_unknown:
+            self.save_stats(stat)
 
+        suffix = "（未计入统计）" if is_unknown else ""
         if error:
-            self.log_message(f"✗ {provider}/{model} | {status_code} | {error}")
+            self.log_message(f"✗ {provider}/{model} | {status_code} | {error}{suffix}")
         else:
             message = (
                 f"✓ {provider}/{model} | 新增输入: {tokens['new_input_tokens']} | "
@@ -636,7 +658,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             message += f" | 耗时: {stat['duration_ms']}ms"
             if stat["ttft_ms"] is not None:
                 message += f" | 首字: {stat['ttft_ms']}ms"
-            self.log_message(message)
+            self.log_message(message + suffix)
 
     # --------------------------------------------------------------- 请求体
 
@@ -646,7 +668,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         这里自动注入，保证 token 统计准确。
         返回 (body, model, is_stream)。
         """
-        model = "unknown"
+        model = UNKNOWN_MODEL
         is_stream = False
 
         if not request_body:
