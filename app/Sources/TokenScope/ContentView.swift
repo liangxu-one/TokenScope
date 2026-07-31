@@ -30,8 +30,9 @@ struct ContentView: View {
         // padding 32 = 464，再窄列就会互相挤压。480 留了 16pt 的 Spacer 余量。
         //
         // 高度**不写死**，由内容撑开：写死的话行数少时底部会空一大片
-        // （实测 700pt 下只有 2 行渠道，尾部白掉约 130pt）。
-        // 增长由明细区的 maxHeight 封顶，见 breakdownList。
+        // （实测 700pt 下只有 2 行渠道，尾部白掉约 87pt）。
+        // 实测窗口高度：2 行 613pt、3 行 656pt、5 行 742pt、6 行及以上 763pt。
+        // 增长上限由明细区那个显式 height 封住，见 breakdownList。
         .frame(width: 480)
         .background(Color(nsColor: .windowBackgroundColor))
         .onAppear { viewModel.startAutoRefresh() }
@@ -229,8 +230,12 @@ struct ContentView: View {
                 // 所以先用 GeometryReader 量出行内容的真实高度，再显式设定。
                 // 不写死行高是刻意的：行高取决于字号和 padding，硬编码一个 42
                 // 等于把版面算术又抄一份，改字号就失效。
-                // 上限 220pt ≈ 5 行；再高的话 7 行就到 828pt，而内屏可见高度
-                // 只有 949pt，菜单栏弹窗几乎顶满屏。
+                // 上限 235pt：单行 43pt（42 + 分隔线），235 正好显示 5 行半 ——
+                // 第 6 行露出半行，一眼看得出还能往下滚。这个"半行"是必要的：
+                // macOS 的滚动条是覆盖式的，不滚动时不显示，若上限取 220（5.1 行）
+                // 第 6 行只露 4pt，看上去就像列表到此为止了。
+                // 也别取太大：300pt 时 7 行会让窗口到 828pt，占掉内屏可见高度
+                // （949pt）的 87%，菜单栏弹窗顶满屏太夸张。
                 ScrollView {
                     VStack(spacing: 0) {
                         ForEach(viewModel.rows) { row in
@@ -244,7 +249,7 @@ struct ContentView: View {
                         }
                     )
                 }
-                .frame(height: min(max(listContentHeight, 1), 220))
+                .frame(height: min(max(listContentHeight, 1), 235))
                 .onPreferenceChange(ListHeightKey.self) { listContentHeight = $0 }
             }
         }
