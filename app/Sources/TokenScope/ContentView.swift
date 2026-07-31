@@ -13,7 +13,9 @@ struct ContentView: View {
             Divider()
             footer
         }
-        .frame(width: 560, height: 500)
+        // ⚠️ 宽度别低于 464pt：表格 5 列固定宽度合计 392 + 列间距 8×5 + 左右
+        // padding 32 = 464，再窄列就会互相挤压。480 留了 16pt 的 Spacer 余量。
+        .frame(width: 480, height: 500)
         .background(Color(nsColor: .windowBackgroundColor))
         .onAppear { viewModel.startAutoRefresh() }
         .onDisappear { viewModel.stopAutoRefresh() }
@@ -50,27 +52,47 @@ struct ContentView: View {
                         : "\(viewModel.summary.requestCount)",
                     color: viewModel.summary.failedCount > 0 ? .orange : .blue
                 )
-                statBadge(
-                    icon: "timer",
-                    label: "首字延迟 P50",
-                    value: formatDuration(viewModel.summary.ttftP50),
-                    color: .teal
-                )
-                statBadge(
-                    icon: "clock",
-                    label: "耗时 P50 / P95",
-                    value: "\(formatDuration(viewModel.summary.durationP50)) / \(formatDuration(viewModel.summary.durationP95))",
-                    color: .indigo
-                )
+                // ⚠️ 两行延迟必须套在 .leading 的 VStack 里，别拆回外层。
+                //
+                // 徽标宽度 = 图标 14 + 间距 6 + max(标签宽, 数值宽)，外层是 .trailing
+                // 对齐，只对齐右边缘 —— 两个徽标宽度一旦不同，图标和数值就阶梯状参差
+                // （历史问题：「首字延迟 P50」比「耗时 P50 / P95」窄 8.4pt）。
+                //
+                // 光靠标签等字数不够：汉字等宽，两个 2 字标签实测都是 70.27pt，
+                // 但数值可能比标签更宽 —— 首字延迟 P50/P95 双双跌破 1s 时格式化成
+                // 「999ms / 999ms」实测 86.36pt，反超标签 16pt，参差就回来了。
+                // 这里改用 .leading 让两行左边缘互相对齐，与字符串宽度无关；
+                // 标签等字数则额外保证右边缘也齐平（这是锦上添花，不是对齐的前提）。
+                //
+                // 请求数徽标故意留在外层 .trailing，维持原有观感。
+                VStack(alignment: .leading, spacing: 5) {
+                    statBadge(
+                        icon: "timer",
+                        label: "首字 P50 / P95",
+                        value: "\(formatDuration(viewModel.summary.ttftP50)) / \(formatDuration(viewModel.summary.ttftP95))",
+                        color: .teal
+                    )
+                    statBadge(
+                        icon: "clock",
+                        label: "耗时 P50 / P95",
+                        value: "\(formatDuration(viewModel.summary.durationP50)) / \(formatDuration(viewModel.summary.durationP95))",
+                        color: .indigo
+                    )
+                }
             }
         }
         .padding(16)
     }
 
+    /// 徽标：图标 + 标签在上、数值在下，数值贴右。
+    ///
+    /// 文字块用 .trailing，于是块内较窄的那行被推到右边。常态下标签比数值宽，
+    /// 效果就是「标签不动、数值贴右」；反过来数值更宽时（如请求数带失败计数
+    /// 「287  (失败 2)」）则是标签被顶到最右边 —— 这是刻意接受的行为。
     private func statBadge(icon: String, label: String, value: String, color: Color) -> some View {
         HStack(spacing: 6) {
             Image(systemName: icon).font(.caption2).foregroundStyle(color).frame(width: 14)
-            VStack(alignment: .leading, spacing: 0) {
+            VStack(alignment: .trailing, spacing: 0) {
                 Text(label).font(.caption2).foregroundStyle(.secondary)
                 Text(value).font(.caption).fontWeight(.semibold)
             }
@@ -237,14 +259,12 @@ struct ContentView: View {
             }
             .frame(width: 52, alignment: .trailing)
 
-            // 延迟
+            // 延迟（均为 P50，P95 见 header 与 tooltip）
             VStack(alignment: .trailing, spacing: 2) {
-                Text(formatDuration(row.ttftP50))
-                    .font(.caption2).foregroundStyle(.teal)
-                Text(formatDuration(row.durationP50))
-                    .font(.caption2).foregroundStyle(.secondary)
+                latencyLine(prefix: "首", value: formatDuration(row.ttftP50), color: .teal)
+                latencyLine(prefix: "总", value: formatDuration(row.durationP50), color: .secondary)
             }
-            .frame(width: 56, alignment: .trailing)
+            .frame(width: 60, alignment: .trailing)
         }
         .padding(EdgeInsets(top: 7, leading: 16, bottom: 7, trailing: 16))
         .help("""
@@ -258,6 +278,16 @@ struct ContentView: View {
             计费等效 \(formatNumber(Int64(row.billableTokens)))
             首字 P50 \(formatDuration(row.ttftP50))　耗时 P50 \(formatDuration(row.durationP50))
             """)
+    }
+
+    /// 延迟一行：单字前缀 + 数值。
+    /// 「首」= 首字延迟、「总」= 总耗时，与 header 的「首字 / 耗时」同一套词；
+    /// 加前缀是因为原来两个裸数字只靠青色/灰色区分，不悬停看 tooltip 读不出谁是谁。
+    private func latencyLine(prefix: String, value: String, color: Color) -> some View {
+        HStack(spacing: 3) {
+            Text(prefix).font(.system(size: 9)).foregroundStyle(.tertiary)
+            Text(value).font(.caption2).foregroundStyle(color)
+        }
     }
 
     private func tokenLine(icon: String, color: Color, value: Int64) -> some View {
@@ -301,11 +331,22 @@ struct ContentView: View {
         return formatNumber(value)
     }
 
+    /// 延迟一律以秒展示，两档精度：<10s 保留一位小数、≥10s 取整。
+    ///
+    /// 不再输出 ms，是为了避免同一行里两个数字单位不一致 —— 首字延迟正好在
+    /// 1 秒上下晃，旧实现会渲染出「900ms / 1.2s」这种混排。统一成秒后
+    /// 值串也变短了（`300ms`→`0.3s`），顺带消掉了数值宽度反超标签的风险。
+    ///
+    /// 不足 0.1s 的按 0.1s 兜底，免得显示成「0.0s」。
+    /// （实测本地代理场景首字最快 1.6s，这条分支基本不会触发。）
+    /// ⚠️ 耗时会超过 100s（实测有 106s 的请求），那时是 3 位数，属预期。
     private func formatDuration(_ ms: Int) -> String {
-        if ms <= 0 { return "—" }
-        if ms >= 10_000 { return String(format: "%.0fs", Double(ms) / 1000) }
-        if ms >= 1_000 { return String(format: "%.1fs", Double(ms) / 1000) }
-        return "\(ms)ms"
+        guard ms > 0 else { return "—" }
+        let seconds = Double(ms) / 1000
+        // 阈值取 9.95 而非 10：否则 9970ms 会四舍五入成「10.0s」，
+        // 与「≥10s 取整」自相矛盾。
+        if seconds < 9.95 { return String(format: "%.1fs", max(seconds, 0.1)) }
+        return String(format: "%.0fs", seconds)
     }
 
     private func timeString(_ date: Date) -> String {

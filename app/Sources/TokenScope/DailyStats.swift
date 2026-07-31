@@ -85,7 +85,9 @@ struct TokenAggregate {
     var cacheCreationTokens: Int64 = 0
     var outputTokens: Int64 = 0
 
-    /// 各请求的首字延迟，用于算分位数
+    /// 各请求的首字延迟，用于算分位数。
+    /// ⚠️ 非流式请求（`stream=false`）拿不到首字，代理侧记的是 null，
+    /// 所以本数组长度可能小于 `durations` —— 两组分位数的样本集并不严格相同。
     private(set) var ttfts: [Int] = []
     /// 各请求的总耗时，用于算分位数
     private(set) var durations: [Int] = []
@@ -139,6 +141,7 @@ struct TokenAggregate {
     }
 
     var ttftP50: Int { percentile(ttfts, 50) }
+    var ttftP95: Int { percentile(ttfts, 95) }
     var durationP50: Int { percentile(durations, 50) }
     var durationP95: Int { percentile(durations, 95) }
 }
@@ -203,6 +206,7 @@ struct TodaySummary {
     var billableTokens: Double = 0
 
     var ttftP50 = 0
+    var ttftP95 = 0
     var durationP50 = 0
     var durationP95 = 0
 
@@ -223,6 +227,7 @@ struct TodaySummary {
         cacheHitRate = aggregate.cacheHitRate
         billableTokens = aggregate.billableTokens
         ttftP50 = aggregate.ttftP50
+        ttftP95 = aggregate.ttftP95
         durationP50 = aggregate.durationP50
         durationP95 = aggregate.durationP95
     }
