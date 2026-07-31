@@ -116,6 +116,7 @@ struct AiStatsService {
         var total = TokenAggregate()
         var byModel: [String: TokenAggregate] = [:]
         var byProvider: [String: TokenAggregate] = [:]
+        var byHour: [Int: TokenAggregate] = [:]
 
         for stat in stats {
             total.add(stat)
@@ -125,6 +126,11 @@ struct AiStatsService {
 
             let provider = stat.provider ?? "unknown"
             byProvider[provider, default: TokenAggregate()].add(stat)
+
+            // 时间戳解析失败的记录只是不进趋势图，仍计入上面的总量
+            if let hour = hour(from: stat.timestamp) {
+                byHour[hour, default: TokenAggregate()].add(stat)
+            }
         }
 
         let modelRows = byModel
@@ -139,8 +145,51 @@ struct AiStatsService {
             dateString: dateString,
             summary: TodaySummary(aggregate: total),
             models: modelRows,
-            providers: providerRows
+            providers: providerRows,
+            hourly: hourlySeries(byHour: byHour, dateString: dateString)
         )
+    }
+
+    /// 把小时分桶补零成连续序列，供趋势图直接消费。
+    ///
+    /// 上界：当天只画到当前小时（未来的小时留空没有意义，也和 cc-switch 的
+    /// x 轴止于「现在」一致）；非当天则画满 23 点。
+    /// `aggregate` 接受任意日期，虽然目前只有 `fetchTodayStats()` 在调，
+    /// 但这里不假设一定是今天。
+    private static func hourlySeries(byHour: [Int: TokenAggregate],
+                                    dateString: String) -> [HourlyPoint] {
+        let lastHour: Int
+        if dateString == todayString() {
+            lastHour = Calendar.current.component(.hour, from: Date())
+        } else {
+            lastHour = 23
+        }
+
+        // 数据里出现过比上界更晚的小时（比如系统时区被改过），一并纳入，
+        // 否则那部分数据会被静默丢掉。
+        let upperBound = max(lastHour, byHour.keys.max() ?? 0)
+
+        return (0...upperBound).map { hour in
+            if let aggregate = byHour[hour] {
+                return HourlyPoint(hour: hour, aggregate: aggregate)
+            }
+            return HourlyPoint(hour: hour)
+        }
+    }
+
+    /// 从时间戳里取小时。
+    ///
+    /// `AiStat.timestamp` 是代理写入的固定格式 `"2026-07-31 09:46:31"`，
+    /// 第 11–12 位就是小时，直接切字符串。
+    /// ⚠️ 不要换成 `DateFormatter` —— 每 30 秒要处理几百到几千条记录，
+    /// 建 formatter 和解析完整日期的开销毫无必要。
+    /// 格式不符时返回 nil，由调用方决定怎么处理。
+    static func hour(from timestamp: String) -> Int? {
+        guard timestamp.count >= 13 else { return nil }
+        let start = timestamp.index(timestamp.startIndex, offsetBy: 11)
+        let end = timestamp.index(start, offsetBy: 2)
+        guard let hour = Int(timestamp[start..<end]), (0...23).contains(hour) else { return nil }
+        return hour
     }
 
     // MARK: - 工具
@@ -166,12 +215,15 @@ struct StatsSnapshot {
     let summary: TodaySummary
     let models: [StatsRow]
     let providers: [StatsRow]
+    /// 逐小时序列，已补零，供趋势图使用
+    let hourly: [HourlyPoint]
 
     static let empty = StatsSnapshot(
         dateString: AiStatsService.todayString(),
         summary: .zero,
         models: [],
-        providers: []
+        providers: [],
+        hourly: []
     )
 
     var isEmpty: Bool { summary.requestCount == 0 }

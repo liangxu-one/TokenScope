@@ -1,11 +1,24 @@
 import SwiftUI
 
+/// 明细列表内容的实测高度，用来给 ScrollView 定高（见 breakdownList 的说明）
+private struct ListHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
 struct ContentView: View {
     @StateObject private var viewModel = StatsViewModel()
+
+    /// 明细行内容撑起来的高度，由 GeometryReader 量出
+    @State private var listContentHeight: CGFloat = 0
 
     var body: some View {
         VStack(spacing: 0) {
             header
+            Divider()
+            TrendChart(points: viewModel.snapshot.hourly)
             Divider()
             statsCards
             Divider()
@@ -15,7 +28,11 @@ struct ContentView: View {
         }
         // ⚠️ 宽度别低于 464pt：表格 5 列固定宽度合计 392 + 列间距 8×5 + 左右
         // padding 32 = 464，再窄列就会互相挤压。480 留了 16pt 的 Spacer 余量。
-        .frame(width: 480, height: 500)
+        //
+        // 高度**不写死**，由内容撑开：写死的话行数少时底部会空一大片
+        // （实测 700pt 下只有 2 行渠道，尾部白掉约 130pt）。
+        // 增长由明细区的 maxHeight 封顶，见 breakdownList。
+        .frame(width: 480)
         .background(Color(nsColor: .windowBackgroundColor))
         .onAppear { viewModel.startAutoRefresh() }
         .onDisappear { viewModel.stopAutoRefresh() }
@@ -101,17 +118,16 @@ struct ContentView: View {
 
     // MARK: - 指标卡
 
+    /// 四张 token 卡。名称/配色/图标全部来自 `TokenSeries`，与趋势图图例共用同一份定义，
+    /// 顺序也由 `TokenSeries.allCases` 决定 —— 两处永远一致，不会各改一处然后对不上。
     private var statsCards: some View {
         VStack(spacing: 10) {
             HStack(spacing: 10) {
-                statCard(icon: "arrow.down.circle", color: .blue,
-                         title: "新增输入", value: formatTokenCount(viewModel.summary.newInputTokens))
-                statCard(icon: "bolt.horizontal.circle", color: .green,
-                         title: "缓存读取", value: formatTokenCount(viewModel.summary.cachedTokens))
-                statCard(icon: "square.and.arrow.down.on.square", color: .orange,
-                         title: "缓存写入", value: formatTokenCount(viewModel.summary.cacheCreationTokens))
-                statCard(icon: "arrow.up.circle", color: .purple,
-                         title: "输出", value: formatTokenCount(viewModel.summary.outputTokens))
+                ForEach(TokenSeries.allCases) { series in
+                    statCard(icon: series.icon, color: series.color,
+                             title: series.title,
+                             value: formatTokenCount(series.value(in: viewModel.summary)))
+                }
             }
             cacheHitCard
         }
@@ -203,6 +219,18 @@ struct ContentView: View {
                 }
                 .frame(maxWidth: .infinity, minHeight: 120)
             } else {
+                // ⚠️ 这里必须给 ScrollView 一个**显式高度**，不能只写 maxHeight。
+                //
+                // ScrollView 没有固有内容高度：它会接受容器给的任何高度提案。
+                // 窗口高度不写死时，它就成了整个 VStack 里唯一可伸缩的元素，
+                // 被动吸收「容器高度 - 其余固定部分」这个差额 —— 在菜单栏弹窗里
+                // 这个差额算出来是 0，列表整个消失（实测真机复现）。
+                //
+                // 所以先用 GeometryReader 量出行内容的真实高度，再显式设定。
+                // 不写死行高是刻意的：行高取决于字号和 padding，硬编码一个 42
+                // 等于把版面算术又抄一份，改字号就失效。
+                // 上限 220pt ≈ 5 行；再高的话 7 行就到 828pt，而内屏可见高度
+                // 只有 949pt，菜单栏弹窗几乎顶满屏。
                 ScrollView {
                     VStack(spacing: 0) {
                         ForEach(viewModel.rows) { row in
@@ -210,8 +238,14 @@ struct ContentView: View {
                             if row.id != viewModel.rows.last?.id { Divider() }
                         }
                     }
+                    .background(
+                        GeometryReader { geo in
+                            Color.clear.preference(key: ListHeightKey.self, value: geo.size.height)
+                        }
+                    )
                 }
-                .frame(maxHeight: 210)
+                .frame(height: min(max(listContentHeight, 1), 220))
+                .onPreferenceChange(ListHeightKey.self) { listContentHeight = $0 }
             }
         }
     }
@@ -317,41 +351,7 @@ struct ContentView: View {
     }
 
     // MARK: - 格式化
-
-    private func formatNumber(_ value: Int64) -> String {
-        let f = NumberFormatter()
-        f.numberStyle = .decimal
-        f.groupingSeparator = ","
-        return f.string(from: NSNumber(value: value)) ?? "\(value)"
-    }
-
-    private func formatTokenCount(_ value: Int64) -> String {
-        if value >= 100_000_000 { return String(format: "%.2f亿", Double(value) / 100_000_000) }
-        if value >= 10_000 { return String(format: "%.1f万", Double(value) / 10_000) }
-        return formatNumber(value)
-    }
-
-    /// 延迟一律以秒展示，两档精度：<10s 保留一位小数、≥10s 取整。
-    ///
-    /// 不再输出 ms，是为了避免同一行里两个数字单位不一致 —— 首字延迟正好在
-    /// 1 秒上下晃，旧实现会渲染出「900ms / 1.2s」这种混排。统一成秒后
-    /// 值串也变短了（`300ms`→`0.3s`），顺带消掉了数值宽度反超标签的风险。
-    ///
-    /// 不足 0.1s 的按 0.1s 兜底，免得显示成「0.0s」。
-    /// （实测本地代理场景首字最快 1.6s，这条分支基本不会触发。）
-    /// ⚠️ 耗时会超过 100s（实测有 106s 的请求），那时是 3 位数，属预期。
-    private func formatDuration(_ ms: Int) -> String {
-        guard ms > 0 else { return "—" }
-        let seconds = Double(ms) / 1000
-        // 阈值取 9.95 而非 10：否则 9970ms 会四舍五入成「10.0s」，
-        // 与「≥10s 取整」自相矛盾。
-        if seconds < 9.95 { return String(format: "%.1fs", max(seconds, 0.1)) }
-        return String(format: "%.0fs", seconds)
-    }
-
-    private func timeString(_ date: Date) -> String {
-        let f = DateFormatter()
-        f.dateFormat = "HH:mm:ss"
-        return f.string(from: date)
-    }
+    //
+    // formatNumber / formatTokenCount / formatDuration / timeString 已移到
+    // Formatting.swift —— 趋势图的纵轴与悬停浮层也需要它们。函数名未变。
 }

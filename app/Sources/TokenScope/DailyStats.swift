@@ -189,6 +189,33 @@ struct StatsRow: Identifiable {
     }
 }
 
+/// 趋势图用的单个小时数据点。
+///
+/// 只带四项 token 总量 —— 图表不看延迟分位数，所以不复用 `StatsRow`
+/// （那个还要拖上 P50、命中率、计费等效等一堆字段）。
+struct HourlyPoint: Identifiable {
+    let hour: Int
+    var id: Int { hour }
+
+    var newInputTokens: Int64 = 0
+    var cachedTokens: Int64 = 0
+    var cacheCreationTokens: Int64 = 0
+    var outputTokens: Int64 = 0
+
+    /// 没有请求的小时用这个补零，好让曲线连续、x 轴保持完整的一天
+    init(hour: Int) {
+        self.hour = hour
+    }
+
+    init(hour: Int, aggregate: TokenAggregate) {
+        self.hour = hour
+        newInputTokens = aggregate.newInputTokens
+        cachedTokens = aggregate.cachedTokens
+        cacheCreationTokens = aggregate.cacheCreationTokens
+        outputTokens = aggregate.outputTokens
+    }
+}
+
 /// 当日总览
 struct TodaySummary {
     var requestCount = 0
