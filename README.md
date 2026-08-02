@@ -83,6 +83,24 @@ cd app
 
 图标出现在菜单栏右上角（⚡），点击查看统计。
 
+窗口默认**跟随系统外观**，也可以在底栏那个图标里单独固定成浅色或深色 ——
+系统是浅色时窗口也能保持深色，反之亦然。选择存在 UserDefaults 里，重启后保留：
+
+```bash
+defaults write com.liangxu.tokenscope appearancePreference dark   # system | light | dark
+```
+
+> 实现上是**直接给宿主 `NSWindow` 设 `NSAppearance`**（借一个空 `NSView` 拿到
+> `view.window`）。两条看起来更自然的路都不行：
+>
+> - `preferredColorScheme` 是靠 preference 往上冒泡、由**场景**消费的，而
+>   `MenuBarExtra(.window)` 的弹窗不是常规场景，**不吃这个 preference**。
+>   症状很有误导性：偏好存下来了、底栏图标也变了，窗口纹丝不动。
+>   用普通 `NSWindow` + `NSHostingView` 写的测试**会通过**（那条路径确实消费
+>   preference），别被它骗了 —— 要验就得在真的 `MenuBarExtra` 里验。
+> - `NSApp.appearance` 是应用级全局，会把菜单栏上那个图标一并拽进指定外观，
+>   而菜单栏自身跟随系统，图标就和它所在的背景不搭。
+
 ## 聚合路由（按模型自动转发）
 
 上面那套是**路径前缀路由**：一个渠道一个 base URL，key 由客户端带、代理只透传。

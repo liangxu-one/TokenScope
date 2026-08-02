@@ -29,6 +29,17 @@ struct ContentView: View {
     /// 余额行内容撑起来的高度，同样由 GeometryReader 量出
     @State private var balanceContentHeight: CGFloat = 0
 
+    /// 窗口外观偏好。`@AppStorage` 自带 UserDefaults 读写，不用自己管持久化。
+    /// 存 rawValue 而不是枚举本身：枚举要 RawRepresentable 适配才能进 AppStorage，
+    /// 存字符串更直白，而且 `defaults read` 出来是人能看懂的。
+    @AppStorage(AppearancePreference.storageKey)
+    private var appearanceRaw = AppearancePreference.system.rawValue
+
+    /// 认不出的值（手改过 plist、或将来删了某个枚举项）一律回落到跟随系统
+    private var appearance: AppearancePreference {
+        AppearancePreference(rawValue: appearanceRaw) ?? .system
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             header
@@ -65,6 +76,13 @@ struct ContentView: View {
         // 那样几个区域会互相抢剩余空间，谁也算不准。
         .frame(width: 480)
         .background(Color(nsColor: .windowBackgroundColor))
+        // 真正把弹窗切成深/浅色的是这一句：直接给宿主 NSWindow 设 NSAppearance。
+        // 只作用于这个窗口，菜单栏那个图标继续跟随系统。
+        .background(WindowAppearance(appearance: appearance.nsAppearance))
+        // 这句管的是 SwiftUI 自己的环境。菜单栏弹窗**不消费**这个 preference
+        // （详见 AppearancePreference.nsAppearance），留着是为了让 SwiftUI 侧的
+        // colorScheme 与窗口保持一致，别让两层各说各话。
+        .preferredColorScheme(appearance.colorScheme)
         .onAppear { viewModel.startAutoRefresh() }
         .onDisappear { viewModel.stopAutoRefresh() }
     }
@@ -574,12 +592,43 @@ struct ContentView: View {
                 Text("更新于 \(timeString(refreshed))")
                     .font(.caption2).foregroundStyle(.tertiary)
             }
+            appearanceMenu
             Button("退出") { NSApp.terminate(nil) }
                 .buttonStyle(.plain)
                 .font(.caption2)
                 .foregroundStyle(.secondary)
         }
         .padding(EdgeInsets(top: 7, leading: 16, bottom: 8, trailing: 16))
+    }
+
+    /// 外观切换。图标反映当前选择，点开是三选一。
+    ///
+    /// 用 `Menu` 包一个 inline `Picker` 而不是自己写三个 Button：
+    /// Picker 自带选中打勾，少写一套状态渲染。
+    /// `menuIndicator(.hidden)` 去掉默认那个下拉箭头 —— footer 这一行只有
+    /// 10pt 字号，多一个箭头就显得挤。
+    private var appearanceMenu: some View {
+        Menu {
+            Picker("", selection: $appearanceRaw) {
+                ForEach(AppearancePreference.allCases) { pref in
+                    Label(pref.title, systemImage: pref.icon).tag(pref.rawValue)
+                }
+            }
+            .pickerStyle(.inline)
+            .labelsHidden()
+        } label: {
+            Image(systemName: appearance.icon).font(.caption2)
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        // ⚠️ 高度必须钉死。Menu 的固有高度比同字号的 Text 高，不约束的话整个
+        // footer 会被顶高 2~3pt，连带窗口总高偏离下面注释里记的那组实测值；
+        // 更烦的是三种外观下它还会差 1pt，切一次外观窗口就抖一下。
+        // 13pt = caption2 的行高，与旁边那几个 Text 齐平。
+        .frame(height: 13)
+        .foregroundStyle(.secondary)
+        .help("窗口外观：\(appearance.title)")
     }
 
     // MARK: - 格式化
