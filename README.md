@@ -87,7 +87,9 @@ cd app
 系统是浅色时窗口也能保持深色，反之亦然。选择存在 UserDefaults 里，重启后保留：
 
 ```bash
-defaults write com.liangxu.tokenscope appearancePreference dark   # system | light | dark
+# 前面那串是 app 的 bundle id，写死在 app/build.sh 里（不随当前用户名变），
+# 所以谁 build 出来都是这个，这行命令可以原样照抄。
+defaults write io.github.liangxu-one.tokenscope appearancePreference dark   # system | light | dark
 ```
 
 > 实现上是**直接给宿主 `NSWindow` 设 `NSAppearance`**（借一个空 `NSView` 拿到
