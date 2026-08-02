@@ -45,3 +45,7 @@ venv/
 # ── 运行时路由配置（含真实域名，本地保留）
 # 参考 proxy/ai_stats_domains.example.json
 proxy/ai_stats_domains.json
+
+# ── 聚合路由的 API key（明文密钥，绝不入库）
+# 参考 proxy/ai_keys.example.json
+proxy/ai_keys.json

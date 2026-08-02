@@ -1,10 +1,73 @@
 {
-    "_comment": "复制本文件为 ai_stats_domains.json 并填入真实域名。路径前缀 → 上游域名。",
+    "_comment": "复制本文件为 ai_stats_domains.json 并填入真实域名。以下划线开头的键一律被忽略，可当注释用。",
+
+    "_routes_comment": "【路径前缀路由】客户端 base URL 写成 http://127.0.0.1:12345/<前缀>，key 由客户端自己带，代理只透传。",
     "routes": {
         "/deepseek": "api.deepseek.com",
         "/minimax": "api.minimaxi.com",
         "/openai": "api.openai.com",
         "/anthropic": "api.anthropic.com",
         "/custom": "your-gateway.example.com"
+    },
+
+    "_aggregate_comment": [
+        "【聚合路由】客户端只填一个 base URL（http://127.0.0.1:12345/auto）和一个占位 key，",
+        "由代理按请求体里的 model 决定转发到哪个上游、注入哪个 key。",
+        "整段删掉即可关闭聚合，routes 的行为完全不受影响。",
+        "API key 不写在这里，写在 ai_keys.json（见 ai_keys.example.json）。"
+    ],
+    "aggregate": {
+        "prefix": "/auto",
+
+        "_targets_comment": [
+            "每个上游按协议给一个 base URL，必须包含该渠道私有的路径前缀。",
+            "转发时直接拼接：base + 客户端剥掉 /auto 后的原路径。所以：",
+            "  /auto/v1/messages        + anthropic base 'https://api.deepseek.com/anthropic'",
+            "    → https://api.deepseek.com/anthropic/v1/messages",
+            "  /auto/v1/chat/completions + openai base 'https://api.deepseek.com'",
+            "    → https://api.deepseek.com/v1/chat/completions",
+            "openai 这一项同时服务 /v1/chat/completions 与 /v1/responses。",
+            "只配了 anthropic 的 target 收到 OpenAI 协议请求会返回 400，反之同理。"
+        ],
+        "targets": {
+            "deepseek": {
+                "openai": "https://api.deepseek.com",
+                "anthropic": "https://api.deepseek.com/anthropic"
+            },
+            "minimax": {
+                "openai": "https://api.minimaxi.com",
+                "anthropic": "https://api.minimaxi.com/anthropic"
+            },
+            "openai": {
+                "openai": "https://api.openai.com"
+            },
+            "anthropic": {
+                "anthropic": "https://api.anthropic.com"
+            },
+            "custom": {
+                "openai": "https://your-gateway.example.com/v1-compat",
+                "anthropic": "https://your-gateway.example.com/api/anthropic"
+            }
+        },
+
+        "_models_comment": [
+            "模型名 → target 名。支持 * ? [] 通配（fnmatch 语法，大小写敏感）。",
+            "匹配顺序：先精确匹配，再按本段的书写顺序做通配匹配、首个命中即返回。",
+            "所以把具体模型名写在通配规则之前就能做特例 —— 下面 deepseek-reasoner 即是。"
+        ],
+        "models": {
+            "deepseek-reasoner": "custom",
+            "deepseek-*": "deepseek",
+            "MiniMax-*": "minimax",
+            "gpt-*": "openai",
+            "o[0-9]*": "openai",
+            "claude-*": "anthropic"
+        },
+
+        "_default_comment": [
+            "都匹配不上时用哪个 target。也用于无请求体的探活请求（GET /auto/v1/models 等），",
+            "因为那些请求解析不出 model。删掉这一行则匹配不上的请求会返回 400 并列出已知规则。"
+        ],
+        "default": "deepseek"
     }
 }

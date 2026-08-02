@@ -1,0 +1,15 @@
+{
+    "_comment": [
+        "复制本文件为 ai_keys.json 并填入真实 key，然后收紧权限：chmod 600 ai_keys.json",
+        "键名必须与 ai_stats_domains.json 里 aggregate.targets 的 target 名一致。",
+        "只有走聚合前缀（/auto）的请求会用到这里的 key；走路径前缀（/deepseek 等）的",
+        "请求仍然透传客户端自己带的凭证，不读本文件。",
+        "以下划线开头的键会被忽略，可当注释用。"
+    ],
+
+    "deepseek": "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "minimax": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "openai": "sk-proj-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "anthropic": "sk-ant-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "custom": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+}

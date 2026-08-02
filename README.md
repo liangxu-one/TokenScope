@@ -18,8 +18,10 @@ token 消耗、缓存命中率与响应延迟，无需安装任何证书。
 ```
 proxy/                    Python 反向代理
   http_proxy.py           主程序：转发 + usage 解析 + 落盘
-  ai_stats_domains.json   路由配置（路径前缀 → 上游域名）
+  ai_stats_domains.json   路由配置（路径前缀 → 上游域名；聚合路由规则）
+  ai_keys.json            聚合路由用的各渠道 API key（不入库）
   stats_report.py         命令行报表工具
+  selftest_usage.py       归一化 / 路由回归自测
 app/                      SwiftUI 菜单栏应用
   Sources/TokenScope/     源码
   icon/                   图标与生成脚本
@@ -80,15 +82,125 @@ cd app
 
 图标出现在菜单栏右上角（⚡），点击查看统计。
 
+## 聚合路由（按模型自动转发）
+
+上面那套是**路径前缀路由**：一个渠道一个 base URL，key 由客户端带、代理只透传。
+想在多个渠道间切模型就得来回改客户端配置。
+
+聚合路由把这件事挪到代理侧：客户端只填**一个** base URL 和一个占位 key，
+代理按请求体里的 `model` 决定转发到哪个上游、注入哪个 key。
+
+### 1. 配好上游与模型规则
+
+在 `ai_stats_domains.json` 里加 `aggregate` 段（完整带注释的示例见
+`ai_stats_domains.example.json`）：
+
+```json
+{
+    "routes": { "...": "原有前缀路由，保持不动" },
+    "aggregate": {
+        "prefix": "/auto",
+        "targets": {
+            "deepseek": {
+                "openai": "https://api.deepseek.com",
+                "anthropic": "https://api.deepseek.com/anthropic"
+            },
+            "minimax": {
+                "openai": "https://api.minimaxi.com",
+                "anthropic": "https://api.minimaxi.com/anthropic"
+            }
+        },
+        "models": {
+            "deepseek-*": "deepseek",
+            "MiniMax-*": "minimax"
+        },
+        "default": "deepseek"
+    }
+}
+```
+
+`targets` 里的 base **要带上该渠道私有的路径前缀**。转发时直接拼接
+`base + 客户端剥掉 /auto 后的原路径`，query string 一并保留：
+
+| 客户端请求                       | target base                            | 实际转发到                                             |
+| -------------------------------- | -------------------------------------- | ------------------------------------------------------ |
+| `/auto/v1/messages?beta=true`  | `https://api.deepseek.com/anthropic` | `https://api.deepseek.com/anthropic/v1/messages?beta=true` |
+| `/auto/v1/chat/completions`    | `https://api.deepseek.com`           | `https://api.deepseek.com/v1/chat/completions`       |
+
+`openai` 这一项同时服务 `/v1/chat/completions` 与 `/v1/responses`。
+只配了 `anthropic` 的 target 收到 OpenAI 协议请求会返回 400，反之同理。
+
+`models` 支持 `*` `?` `[]` 通配（fnmatch 语法，**大小写敏感**）。
+匹配顺序是**先精确、再按书写顺序通配**，所以把具体模型名写在通配规则前面就能做特例。
+
+### 2. 填 key
+
+```bash
+cd proxy
+cp ai_keys.example.json ai_keys.json
+chmod 600 ai_keys.json          # 明文密钥，收紧权限
+```
+
+键名与 `aggregate.targets` 的 target 名一致。代理会按协议自动选注入方式：
+anthropic 用 `x-api-key`（并在缺失时补 `anthropic-version`），openai 用
+`Authorization: Bearer`。**客户端自己带的凭证会先被剔除**，避免上游同时收到两套。
+
+> `ai_keys.json` 已在 `.gitignore` 中。启动时若发现它同组/其他用户可读，会打一条 WARN。
+
+### 3. 客户端只填一个地址
+
+```bash
+ANTHROPIC_BASE_URL=http://127.0.0.1:12345/auto
+ANTHROPIC_AUTH_TOKEN=placeholder        # 占位即可，会被代理替换
+```
+
+### 与前缀路由的关系
+
+- **前缀优先**：`routes` 先匹配，命中就原样透传（`auth=None`），行为与加聚合前逐字相同。
+  聚合出问题时把 base URL 改回带前缀的写法即可立即回退。
+- 落盘的 `provider` 记的是**真实 target 名**（`deepseek` / `minimax`…），不是 `auto`。
+  所以菜单栏应用与 `stats_report.py` 无需改动，聚合流量还会和走老前缀的同渠道流量合并到一行。
+- 整段删掉 `aggregate` 即关闭该特性。
+- 配置不全（模型没匹配上、target 缺端点、缺 key）时返回 **400 并在 body 里说明缺什么**，
+  不会把请求转发到一个猜出来的地址 —— 那样客户端只会看到一个和真实原因无关的上游报错。
+  这类失败只打日志、不落盘（属代理配置错误，不是真实 API 消耗）。
+
 ## 统计口径
 
 各厂商返回的 usage 字段语义不一致，代理会先做归一化再落盘。
 判断依据**只看输入总量字段名**，与厂商、模型无关：
 
-| 上游字段          | 语义                       | 换算                                   |
-| ----------------- | -------------------------- | -------------------------------------- |
-| `input_tokens`  | 不含缓存（Anthropic 风格） | `new_input = input_tokens`           |
-| `prompt_tokens` | 已含缓存（OpenAI 风格）    | `new_input = prompt_tokens - cached` |
+| 上游字段                                | 语义                                     | 换算                                                  |
+| --------------------------------------- | ---------------------------------------- | ----------------------------------------------------- |
+| `input_tokens`                        | 不含缓存（Anthropic 风格）               | `new_input = input_tokens`                          |
+| `prompt_tokens`                       | 已含缓存（OpenAI Chat Completions 风格） | `new_input = prompt_tokens - cached`                |
+| `input_tokens` + `input_tokens_details` | 已含缓存**读和写**（OpenAI Responses 风格） | `new_input = input_tokens - cached - cache_write` |
+
+> ⚠️ 第三行是唯一的例外，也是最容易算错的一处：**Responses API 的字段名叫
+> `input_tokens`（和 Anthropic 一样），但语义是 OpenAI 的**。照 Anthropic 那样直接
+> 取用，缓存部分会被算进新增输入（成本虚高），而 `cache_read_input_tokens` 又取不到
+> → 命中率恒为 0%。
+>
+> 判据用的是 `input_tokens_details` 这个**容器名**。它与 Chat Completions 的
+> `prompt_tokens_details` 是两个不同的键，所以并不违反「不能用缓存字段名判断」那条
+> —— 那条说的是 `cached_tokens` 这类叶子字段会跨风格并存，容器名不会。
+>
+> 而且要减**两项**（读 + 写），不是只减 `cached`。这一点与 cc-switch 一致
+> （`src-tauri/src/proxy/usage/calculator.rs` 的 `calculate_with_cache_semantics()`）；
+> 那边还留着 `INPUT_TOKEN_SEMANTICS_LEGACY / TOTAL / FRESH` 三态常量 —— 早期只减了
+> `cache_read`，是后来发现漏减 `cache_write` 才补的迁移。
+>
+> 减完后 `new_input + cached + cache_creation` 恰好等于上游报的 `input_tokens`，
+> 命中率分母仍是「上游声称的总输入」，与本项目既有口径自洽。
+
+Responses API 另有两处与 Chat Completions 不同，都已处理：
+
+- **流式 usage 嵌在事件的 `response` 对象里**，不在事件顶层
+  （`{"type":"response.completed","response":{...,"usage":{...}}}`）。
+  只看顶层会让每条流式请求静默记成 0 token。
+- **不能注入 `stream_options.include_usage`**。Responses 版 `stream_options` 只有
+  `include_obfuscation` 这一个键，塞 `include_usage` 是非法嵌套参数、上游直接 400。
+  它本来也不需要 —— 终值事件无条件带 usage。
 
 落盘后的字段：
 
@@ -139,14 +251,16 @@ cd app
 
 Anthropic 协议的 usage 分两个事件下发，各家行为差异很大（实测）：
 
-| 渠道     | `message_start`       | `message_delta`       |
-| -------- | ----------------------- | ----------------------- |
-| DeepSeek | `input=20837`         | `input=20837`（一致） |
-| MiniMax  | `input=0`             | `input=280`           |
-| 阿里云   | `input=24681`（粗估） | `input=6`（真值）     |
+| 行为                        | `message_start`       | `message_delta`   |
+| --------------------------- | ----------------------- | ------------------- |
+| 两边一致                    | `input=20837`         | `input=20837`     |
+| `start` 为空              | `input=0`             | `input=280`       |
+| `start` 粗估、`delta` 真 | `input=24681`         | `input=6`         |
 
 因此 **`message_delta` 是权威终值，直接覆盖**；`message_start` 只用于填补尚为 0 的字段。
-**不能取最大值** —— 否则阿里云的新增输入会被高估上万，命中率被严重低估。
+
+> ⚠️ **不能取最大值。** 碰上第三种行为时，`max()` 会永远取到那个虚高的预估值，
+> 新增输入被高估上万、命中率被严重低估。三种都是真实抓包结果，第三种别当成理论情况。
 
 ## 环境变量
 
@@ -170,6 +284,20 @@ python3 stats_report.py --all        # 全部历史
 
 输出总览、按渠道、按模型、按渠道+协议四张表，含命中率与延迟分位数。
 可用于校验菜单栏应用的数值是否一致。
+
+## 回归自测
+
+```bash
+cd proxy
+python3 selftest_usage.py
+```
+
+纯 stdlib `assert`，不引依赖、不需要测试框架。把上面「统计口径」里每条结论都钉成断言：
+三种风格的归一化、两种缓存字段并存的混合形态、`message_delta` 权威覆盖、
+Responses 的嵌套 usage 与嵌套 error、聚合路由的 URL 拼接与密钥注入。
+
+改归一化或路由逻辑前后都跑一下。这些数字错了不会报错也不会崩，只会让界面上的值
+静静地偏掉几万 —— 肉眼发现不了。
 
 ## 数据文件
 

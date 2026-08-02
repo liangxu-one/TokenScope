@@ -53,12 +53,14 @@ new-api 的分母只含 new_input + cached（见 ChannelAffinityUsageCacheModal.
 """
 
 import builtins
+import fnmatch
 import gzip
 import json
 import logging
 import os
 import re
 import ssl
+import stat
 import threading
 import time
 import urllib.error
@@ -74,6 +76,11 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # 配置文件路径（相对路径）
 DOMAINS_FILE = os.path.join(SCRIPT_DIR, "ai_stats_domains.json")
+
+# 聚合路由用的 API key，与路由配置分开存放：
+# 路由配置里只有域名，可以安全分享；这个文件是纯密钥，单独 gitignore + chmod 600。
+KEYS_FILE = os.path.join(SCRIPT_DIR, "ai_keys.json")
+
 STATS_DIR = SCRIPT_DIR
 STATS_PREFIX = "ai_stats-"
 
@@ -84,6 +91,27 @@ UNKNOWN_MODEL = "unknown"
 LISTEN_HOST = "127.0.0.1"
 LISTEN_PORT = 12345
 UPSTREAM_TIMEOUT = 300
+
+# api_format → aggregate.targets 里取哪个端点。
+# Responses 与 Chat Completions 共用 openai 端点：两者都挂在同一个 base 下，
+# 差别只在路径（/v1/responses vs /v1/chat/completions），而路径是客户端给的。
+BUCKET_FOR_FORMAT = {
+    "anthropic": "anthropic",
+    "openai": "openai",
+    "openai-responses": "openai",
+}
+
+# 聚合模式下要从客户端请求里剔除的凭证头（代理自己持有真 key）
+CLIENT_AUTH_HEADERS = {
+    "authorization",
+    "x-api-key",
+    "api-key",
+    "apikey",
+}
+
+# 客户端没带 anthropic-version 时补的默认值。Anthropic 协议要求这个头，
+# 缺了会 400；Claude Code 一定会带，裸 curl 常常忘。
+DEFAULT_ANTHROPIC_VERSION = "2023-06-01"
 
 # 统计文件保留天数（含今天）。设为 0 则永不清理。
 RETENTION_DAYS = int(os.environ.get("AI_PROXY_RETENTION_DAYS", "3"))
@@ -170,8 +198,23 @@ def setup_logging():
     return logger
 
 
-def load_routes():
-    """从配置文件加载路由规则"""
+def strip_comment_keys(mapping):
+    """
+    过滤掉以下划线开头的键，便于在 JSON 配置里写注释（JSON 没有注释语法）。
+    非 dict 输入返回空 dict，这样调用方不必逐个做类型判断。
+    """
+    if not isinstance(mapping, dict):
+        return {}
+    return {k: v for k, v in mapping.items() if not str(k).startswith("_")}
+
+
+def read_domains_file():
+    """
+    读取并解析路由配置文件，返回原始 dict。
+
+    routes 与 aggregate 两段都从这里取，所以单独拆出来 —— 否则两个 loader
+    各自打开一次文件，配置文件缺失时会把同一条错误打印两遍。
+    """
     if not os.path.exists(DOMAINS_FILE):
         example = DOMAINS_FILE.replace(".json", ".example.json")
         print(f"[ERROR] 未找到路由配置: {DOMAINS_FILE}")
@@ -183,14 +226,92 @@ def load_routes():
     try:
         with open(DOMAINS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-            # 忽略以下划线开头的键，便于在配置里写注释
-            return {
-                k: v for k, v in (data.get("routes") or {}).items()
-                if not k.startswith("_")
-            }
+        return data if isinstance(data, dict) else {}
     except Exception as e:
         print(f"[ERROR] 加载路由配置失败: {e}")
         return {}
+
+
+def load_routes(data):
+    """从已解析的配置里取出路径前缀 → 上游域名的映射"""
+    return strip_comment_keys(data.get("routes"))
+
+
+def load_aggregate(data):
+    """
+    从已解析的配置里取出聚合路由配置，返回归一化后的 dict；未配置则返回 None。
+
+    归一化后的形状：
+        {"prefix": "/auto", "targets": {...}, "models": {...}, "default": "deepseek" | None}
+
+    models 的**书写顺序有意义**：json.load 建出的 dict 保持文档顺序
+    （Python 3.7+ 保证），match_model() 按顺序做通配匹配、首个命中即返回。
+    所以把 deepseek-v4-flash 写在 deepseek-* 之前就能特例化单个模型。
+    """
+    aggregate = data.get("aggregate")
+    if not isinstance(aggregate, dict):
+        return None
+
+    prefix = aggregate.get("prefix") or "/auto"
+    if not prefix.startswith("/"):
+        prefix = "/" + prefix
+    # 结尾的斜杠会让 path[len(prefix):] 少切一个字符，统一去掉
+    prefix = prefix.rstrip("/") or "/auto"
+
+    targets = {
+        name: strip_comment_keys(conf)
+        for name, conf in strip_comment_keys(aggregate.get("targets")).items()
+        if isinstance(conf, dict)
+    }
+
+    return {
+        "prefix": prefix,
+        "targets": targets,
+        "models": strip_comment_keys(aggregate.get("models")),
+        "default": aggregate.get("default"),
+    }
+
+
+def load_keys():
+    """
+    加载 target 名 → API key。文件不存在返回 {}（未启用聚合时属于正常情况）。
+
+    只接受字符串值：写成对象或数组一定是配置写错了，静默忽略比带着一个
+    非法值跑到注入请求头时才炸要好定位。
+    """
+    if not os.path.exists(KEYS_FILE):
+        return {}
+
+    try:
+        with open(KEYS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"[ERROR] 加载密钥配置失败: {e}")
+        return {}
+
+    return {
+        name: value
+        for name, value in strip_comment_keys(data).items()
+        if isinstance(value, str) and value
+    }
+
+
+def warn_if_keys_world_readable():
+    """
+    密钥文件权限过宽时提醒一句。只提醒不自动改 —— 悄悄改用户文件的权限
+    不是代理该干的事，但这个文件里是明文 key，同组可读值得说一声。
+    """
+    if not os.path.exists(KEYS_FILE):
+        return
+    try:
+        mode = os.stat(KEYS_FILE).st_mode
+    except OSError:
+        return
+    if mode & (stat.S_IRGRP | stat.S_IROTH):
+        print(
+            f"[WARN] {os.path.basename(KEYS_FILE)} 权限为 {oct(mode & 0o777)}，"
+            f"同组或其他用户可读。建议：chmod 600 {os.path.basename(KEYS_FILE)}"
+        )
 
 
 def stats_file_for(dt):
@@ -293,15 +414,26 @@ def extract_stream_error(event):
     从单个 SSE 事件里提取错误描述，没有错误返回 None。
 
     流式响应的 200 状态头在 body 生成之前就发出去了，上游中途出错时改不了状态码，
-    只能在流里塞一个错误事件。认两种形态：
+    只能在流里塞一个错误事件。认三种形态：
 
         Anthropic    {"type":"error","error":{"type":"overloaded_error","message":"..."}}
         OpenAI 兼容  {"error":{"message":"...","code":"..."}}
+        Responses    {"type":"response.failed","response":{"error":{...}}}
 
     **必须用真值判断而不是 `"error" in event`**：OpenAI 风格的正常 chunk 里常年带着
     `"error": null`，用 in 判断会把每一条流式请求都标成失败。
     """
     err = event.get("error")
+
+    # Responses API 把 error 也嵌在 response 对象里（和 usage 一样），
+    # 顶层既没有 error 也不是 type=="error"。不认这一层的话，一次失败的
+    # Responses 流会被记成一次干净的成功 —— status 是 200，输出为 0，
+    # 而 jsonl 里没有任何线索能解释为什么。
+    if not err:
+        nested = event.get("response")
+        if isinstance(nested, dict):
+            err = nested.get("error")
+
     if not err and (event.get("type") or "") != "error":
         return None
 
@@ -314,6 +446,16 @@ def extract_stream_error(event):
 
     # type 是 error 但没有 error 字段：形态不认识，整条留下，别把信息丢了
     return json.dumps(event, ensure_ascii=False)
+
+
+class AggregateRouteError(Exception):
+    """
+    聚合路由配置问题（模型没匹配上、target 缺端点、缺 key）。
+
+    刻意用异常而不是返回一个"猜出来的"上游地址：配置不全时把请求转发出去，
+    客户端拿到的会是上游对一个错误 URL 的报错，和真实原因毫无关系，极难排查。
+    统一转成 400 并在 body 里说清缺什么。
+    """
 
 
 class Capture:
@@ -394,6 +536,10 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 class ProxyHandler(BaseHTTPRequestHandler):
     routes = {}
+    # 聚合路由配置与密钥，由 main() 在启动时填入。aggregate 为 None 表示未启用，
+    # 此时 resolve_route 的行为与加这个特性之前完全一致。
+    aggregate = None
+    keys = {}
     stats_lock = threading.Lock()
     protocol_version = "HTTP/1.1"
 
@@ -410,10 +556,20 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     # ------------------------------------------------------------- 路由解析
 
-    def resolve_route(self):
+    def resolve_route(self, model=UNKNOWN_MODEL, api_format="openai"):
         """
-        根据路径前缀确定 provider 与上游 URL。
-        返回 (provider, upstream_url)。
+        确定 provider、上游 URL 与凭证。返回 (provider, upstream_url, auth)。
+
+        auth 为 None 表示"透传客户端自己带的 key"，也就是加聚合特性之前的
+        全部行为；只有走聚合前缀时才会返回 {"key": ..., "style": ...}。
+
+        匹配顺序（前缀优先于聚合是刻意的）：
+          1. routes 里的路径前缀 → 原样转发，auth=None
+          2. aggregate.prefix（默认 /auto）→ 按 model 查表决定上游 + 注入 key
+          3. 都没命中 → 退回 Host 头，auth=None
+
+        把现有前缀放在最前，意味着已有的四条链路一个字节都不受影响，
+        聚合出问题时把 base URL 改回带前缀的写法即可立即回退。
         """
         path = self.path
 
@@ -425,18 +581,126 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 if not stripped_path.startswith("/"):
                     stripped_path = "/" + stripped_path
                 provider = prefix.lstrip("/") or "default"
-                return provider, f"{domain}{stripped_path}"
+                return provider, f"{domain}{stripped_path}", None
+
+        aggregate = self.aggregate
+        if aggregate:
+            prefix = aggregate["prefix"]
+            if path == prefix or path.startswith(prefix + "/"):
+                return self.resolve_aggregate(path, prefix, model, api_format)
 
         # 未匹配任何前缀：退回 Host 头
         host = self.headers.get("Host", "")
         if ":" in host:
             host = host.split(":")[0]
-        return "unknown", f"https://{host}{path}"
+        return "unknown", f"https://{host}{path}", None
+
+    @classmethod
+    def match_model(cls, model):
+        """
+        把模型名映射到 target 名，匹配不上返回 default（没配 default 则 None）。
+
+        精确匹配优先于通配，这样 {"deepseek-*": "a", "deepseek-v4-flash": "b"}
+        里 deepseek-v4-flash 会命中更具体的那条，与书写顺序无关。
+        通配则严格按配置书写顺序，首个命中即返回（见 load_aggregate 的说明）。
+        """
+        aggregate = cls.aggregate or {}
+        models = aggregate.get("models") or {}
+
+        if model in models:
+            return models[model]
+
+        # fnmatchcase 而非 fnmatch：模型名大小写敏感（MiniMax-M3 vs minimax-m3），
+        # fnmatch 在 macOS 上会按 os.path.normcase 折叠大小写，导致规则误命中。
+        for pattern, target in models.items():
+            if fnmatch.fnmatchcase(model, pattern):
+                return target
+
+        return aggregate.get("default")
+
+    def resolve_aggregate(self, path, prefix, model, api_format):
+        """
+        聚合路由：按 model 决定上游与凭证。
+        返回 (provider, upstream_url, auth)，配置不全时抛 AggregateRouteError。
+
+        provider 返回的是 **target 名**（deepseek / minimax / ...），不是 "auto"。
+        这样落盘的渠道维度仍然是真实上游，菜单栏应用与 stats_report 无需改动，
+        而且聚合流量会和走老前缀的同渠道流量自然合并到一行。
+        """
+        aggregate = self.aggregate
+        # 保留 query string：现有数据里 /v1/messages?beta=true 是常态，切丢了就变了语义
+        rest = path[len(prefix):]
+        if not rest.startswith("/"):
+            rest = "/" + rest
+
+        target_name = self.match_model(model)
+        if not target_name:
+            known = ", ".join((aggregate.get("models") or {}).keys())
+            raise AggregateRouteError(
+                f"模型 {model!r} 没有匹配的聚合路由规则，且未配置 aggregate.default。"
+                f"已知规则: {known or '(models 为空)'}"
+            )
+
+        target = (aggregate.get("targets") or {}).get(target_name)
+        if not target:
+            raise AggregateRouteError(
+                f"模型 {model!r} 指向 target {target_name!r}，"
+                f"但 aggregate.targets 里没有这个条目"
+            )
+
+        bucket = BUCKET_FOR_FORMAT.get(api_format, "openai")
+        base = target.get(bucket)
+        if not base:
+            configured = ", ".join(k for k in target if k in ("openai", "anthropic"))
+            raise AggregateRouteError(
+                f"target {target_name!r} 未配置 {bucket!r} 端点，"
+                f"无法转发 {api_format} 协议的请求（已配置: {configured or '无'}）"
+            )
+
+        key = self.keys.get(target_name)
+        if not key:
+            raise AggregateRouteError(
+                f"{os.path.basename(KEYS_FILE)} 里缺少 target {target_name!r} 的 key"
+            )
+
+        if not base.startswith("http"):
+            base = f"https://{base}"
+        # base 末尾若带斜杠，拼上以 / 开头的 rest 会出现 //
+        base = base.rstrip("/")
+
+        return target_name, f"{base}{rest}", {"key": key, "style": bucket}
+
+    def send_json_error(self, status_code, message):
+        """
+        以 JSON 形式返回代理自身产生的错误。
+
+        用 JSON 而不是纯文本：客户端（Claude Code 等）会尝试解析错误体并把
+        message 显示出来，纯文本只会看到一句无信息量的通用失败。
+        """
+        body = json.dumps(
+            {"error": {"type": "tokenscope_route_error", "message": message}},
+            ensure_ascii=False,
+        ).encode("utf-8")
+        self.relay_headers(
+            status_code,
+            [("Content-Type", "application/json; charset=utf-8")],
+            chunked=False,
+            content_length=len(body),
+        )
+        self.wfile.write(body)
+        self.wfile.flush()
 
     @staticmethod
     def detect_api_format(path):
-        """根据路径判断 API 协议格式：anthropic 或 openai"""
+        """
+        根据路径判断 API 协议格式：openai-responses / anthropic / openai。
+
+        /responses 必须**先判**：它比 "/messages"、"anthropic" 更具体，
+        否则 /anthropic/v1/responses 这类网关路径会被误判成 anthropic。
+        """
         lowered = path.lower()
+        if "/responses" in lowered:
+            return "openai-responses"
         if "/messages" in lowered or "anthropic" in lowered:
             return "anthropic"
         return "openai"
@@ -477,6 +741,49 @@ class ProxyHandler(BaseHTTPRequestHandler):
         }
 
     @staticmethod
+    def normalize_responses_usage(usage):
+        """
+        OpenAI Responses API 格式（POST /v1/responses）。
+
+        ⚠️ 这是最容易算错的一种：字段名叫 input_tokens（和 Anthropic 一样），
+        但语义是 OpenAI 的 —— input_tokens 是**总输入**，同时包含缓存读和缓存写。
+        照 Anthropic 那样直接取用会把缓存部分算进新增输入，成本虚高、命中率恒为 0。
+
+        减掉两项而不只减 cached，依据是 cc-switch 的实现
+        （src-tauri/src/proxy/usage/calculator.rs, calculate_with_cache_semantics）：
+
+            input_tokens.saturating_sub(cache_read).saturating_sub(cache_creation)
+
+        那边还留着 INPUT_TOKEN_SEMANTICS_LEGACY / TOTAL / FRESH 三态常量——
+        早期只减了 cache_read，是后来发现漏减 cache_write 才补的迁移。别重犯。
+
+        字段结构见 openai-python types/responses/response_usage.py：
+            input_tokens
+            input_tokens_details  { cached_tokens, cache_write_tokens }
+            output_tokens
+            output_tokens_details { reasoning_tokens }   ← 已计入 output_tokens，不另加
+            total_tokens
+
+        减完后 new_input + cached + cache_creation 恰好等于上游报的 input_tokens，
+        命中率分母仍是「上游声称的总输入」，与本项目既有口径自洽。
+        """
+        usage = usage or {}
+        details = usage.get("input_tokens_details") or {}
+
+        cached = details.get("cached_tokens") or 0
+        cache_write = details.get("cache_write_tokens") or 0
+        total_input = usage.get("input_tokens") or 0
+
+        return {
+            # max(..., 0) 对应 cc-switch 的 saturating_sub：网关字段互相矛盾时
+            # 宁可算成 0，也不能出现负数把汇总值拉低
+            "new_input_tokens": max(total_input - cached - cache_write, 0),
+            "cached_tokens": cached,
+            "cache_creation_tokens": cache_write,
+            "output_tokens": usage.get("output_tokens") or 0,
+        }
+
+    @staticmethod
     def normalize_anthropic_usage(usage):
         """Anthropic 格式：input_tokens 本身就不含缓存，无需相减。"""
         usage = usage or {}
@@ -509,13 +816,25 @@ class ProxyHandler(BaseHTTPRequestHandler):
             input_tokens   → anthropic 语义，该值不含缓存，直接用
             prompt_tokens  → openai 语义，该值已含缓存，需减去 cached
 
-        ⚠️ 不能用缓存字段名来判断。实测阿里云的 message_delta 会同时出现
+        ⚠️ 不能用缓存字段名来判断。实测有网关的 message_delta 会同时出现
         两种风格的字段（cache_read_input_tokens 与 prompt_tokens_details 并存），
         只有输入总量字段是互斥的、可靠的。
 
-        返回 "anthropic" / "openai" / None（无法判断）。
+        返回 "openai-responses" / "anthropic" / "openai" / None（无法判断）。
         """
         usage = usage or {}
+
+        # Responses API 是上面那条规则的唯一例外，必须先判：它的输入总量字段
+        # 也叫 input_tokens，但语义是 OpenAI 的（含缓存），落到下面会被误判成
+        # anthropic 而漏掉减法。
+        #
+        # 用 input_tokens_details 这个**容器名**作标记是安全的：它与 Chat
+        # Completions 的 prompt_tokens_details 是两个不同的键，所以并不违反
+        # 上面「不能用缓存字段名判断」那条 —— 那条说的是 cached_tokens /
+        # cache_read_input_tokens 这类叶子字段会跨风格并存，容器名不会。
+        if "input_tokens_details" in usage:
+            return "openai-responses"
+
         has_input = "input_tokens" in usage
         has_prompt = "prompt_tokens" in usage
 
@@ -533,9 +852,21 @@ class ProxyHandler(BaseHTTPRequestHandler):
         """
         把任意厂商的 usage 归一化。优先按字段判断语义，
         无法判断时才退回按 URL 路径推测的 api_format。
+
+        ⚠️ 这个「字段优先于路径」的优先级对 Responses API 也刻意保持不变，
+        不要改成 api_format == "openai-responses" 就强制走 responses 分支：
+
+          - 有网关在 /responses 上返回 Chat Completions 形态的 usage
+            （prompt_tokens）。按字段判断能正确减 cached，按路径硬判会算错。
+          - 网关完全省略 input_tokens_details 时，两条路径结果恒等
+            （cached 与 cache_write 都是 0，减不减一样）。
+
+        所以维持字段优先严格更优，没有需要路径反超的情形。
         """
         usage = usage or {}
         semantic = cls.detect_usage_semantic(usage) or api_format or "openai"
+        if semantic == "openai-responses":
+            return cls.normalize_responses_usage(usage)
         if semantic == "anthropic":
             return cls.normalize_anthropic_usage(usage)
         return cls.normalize_openai_usage(usage)
@@ -545,15 +876,16 @@ class ProxyHandler(BaseHTTPRequestHandler):
         """
         将 incoming 的 usage 合并进 base。
 
-        各家厂商的两阶段 usage 行为差异很大（均为实测结果）：
+        各家厂商的两阶段 usage 行为差异很大，实测见过三种：
 
-            渠道        message_start        message_delta
-            DeepSeek    input=20837          input=20837   （两边一致）
-            MiniMax     input=0              input=280     （start 为空）
-            阿里云      input=24681          input=6       （start 是粗估，delta 才真）
+            行为                 message_start        message_delta
+            两边一致             input=20837          input=20837
+            start 为空           input=0              input=280
+            start 粗估、delta 真 input=24681          input=6
 
-        可见 message_delta 才是权威的最终值，不能用 max() 取最大值——
-        否则阿里云会永远取到那个虚高的预估值，使新增输入被大幅高估。
+        可见 message_delta 才是权威的最终值，**不能用 max() 取最大值**——
+        碰上第三种行为时会永远取到那个虚高的预估值，新增输入被高估上万、
+        命中率被严重低估。这三种都是真实抓包结果，第三种务必别当成理论情况。
 
         authoritative=True 时直接覆盖（用于 message_delta）；
         authoritative=False 时只填补尚为 0 的字段（用于 message_start 的预估）。
@@ -667,6 +999,17 @@ class ProxyHandler(BaseHTTPRequestHandler):
         OpenAI 格式的流式请求若未开启 include_usage，上游不会返回 usage。
         这里自动注入，保证 token 统计准确。
         返回 (body, model, is_stream)。
+
+        ⚠️ 下面那个注入条件必须**严格等于 "openai"**，不要放宽成
+        `api_format != "anthropic"` 或加上 "openai-responses"：
+
+        Responses API 也有 stream_options，但里面**只有 include_obfuscation
+        这一个键，没有 include_usage**（见 openai-python
+        types/responses/response_create_params.py 的 StreamOptions）。
+        塞进去是非法嵌套参数，上游直接 400 —— 不是统计不准，是请求打不通。
+
+        而且它本来就不需要注入：Responses API 无条件在终值事件
+        （response.completed / response.incomplete）里带 usage。
         """
         model = UNKNOWN_MODEL
         is_stream = False
@@ -696,8 +1039,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         return request_body, model, is_stream
 
-    def build_upstream_headers(self, body_length):
-        """构造转发给上游的请求头"""
+    def build_upstream_headers(self, body_length, auth=None):
+        """
+        构造转发给上游的请求头。
+
+        auth 为 None 时（走老前缀或 Host 回退）行为与加聚合特性之前逐字相同：
+        客户端自己带的 Authorization / x-api-key 原样透传。
+        """
         headers = {}
         for key, value in self.headers.items():
             lowered = key.lower()
@@ -705,12 +1053,27 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 continue
             if lowered in ("host", "content-length", "accept-encoding"):
                 continue
+            # 聚合模式下代理自己持有真 key，必须先把客户端那份剔掉。
+            # 不剔的话上游会同时收到两套凭证（客户端填的通常是占位符），
+            # 用哪个取决于上游实现，实测各家不一致。
+            if auth and lowered in CLIENT_AUTH_HEADERS:
+                continue
             headers[key] = value
 
         # 只声明标准库能解压的编码，避免 br / zstd 导致无法解析
         headers["Accept-Encoding"] = "gzip, deflate"
         if body_length:
             headers["Content-Length"] = str(body_length)
+
+        if auth:
+            if auth["style"] == "anthropic":
+                headers["x-api-key"] = auth["key"]
+                # 客户端带了就不动 —— 版本号可能是有意指定的，覆盖会改变上游行为
+                if not any(k.lower() == "anthropic-version" for k in headers):
+                    headers["anthropic-version"] = DEFAULT_ANTHROPIC_VERSION
+            else:
+                headers["Authorization"] = f"Bearer {auth['key']}"
+
         return headers
 
     # --------------------------------------------------------------- 响应头
@@ -747,7 +1110,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     def do_request(self, method):
         started_at = time.time()
-        provider, upstream_url = self.resolve_route()
         api_format = self.detect_api_format(self.path)
 
         # 读取请求体
@@ -760,12 +1122,31 @@ class ProxyHandler(BaseHTTPRequestHandler):
         original_body = request_body
         request_body, model, is_stream = self.build_upstream_body(request_body, api_format)
 
+        # ⚠️ 路由必须排在解析请求体之后：聚合模式要靠 body 里的 model 决定去哪个
+        # 上游。这与加聚合特性之前的顺序相反（那时是先路由再读体）。
+        # 安全性：resolve_route 不碰 socket，唯一的时序约束是"读完 body 再写响应"，
+        # 调序后仍然满足。
+        try:
+            provider, upstream_url, auth = self.resolve_route(
+                model=model, api_format=api_format
+            )
+        except AggregateRouteError as e:
+            # 只打日志、不落盘。这是代理侧的配置错误，不是一次真实的 API 消耗，
+            # 落盘就得给它编一个 provider 名，白白污染渠道维度。
+            # （与 record() 里"model 未知只打日志不落盘"是同一个取舍。）
+            self.log_message(f"✗ 聚合路由失败 | 模型: {model} | {e}")
+            try:
+                self.send_json_error(400, str(e))
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
+
         self.log_message(
             f"→ {method} {provider} {self.path} | 模型: {model} | "
             f"格式: {api_format} | 流式: {is_stream}"
         )
 
-        headers = self.build_upstream_headers(len(request_body))
+        headers = self.build_upstream_headers(len(request_body), auth=auth)
 
         capture = None
         if CAPTURE_ENABLED:
@@ -774,7 +1155,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
             capture.add(
                 "识别结果",
                 f"provider={provider}\napi_format={api_format}\n"
-                f"model(请求)={model}\nstream(请求)={is_stream}",
+                f"model(请求)={model}\nstream(请求)={is_stream}\n"
+                # 排查"这条到底走了哪条规则"时，这一行是唯一的依据
+                f"路由方式={'聚合(按 model)' if auth else '路径前缀/Host 透传'}",
             )
             capture.add_headers("客户端请求头", self.headers.items())
             capture.add_headers("转发给上游的请求头", headers.items())
@@ -1146,6 +1529,36 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         f"[message_delta] {json.dumps(usage, ensure_ascii=False)}"
                     )
 
+        # Responses API: usage 嵌在事件的 response 对象里，**不在事件顶层**，
+        # 所以必须排在下面那条 `event.get("usage")` 之前，否则永远取不到，
+        # 整条流式请求会静默记成 0 token。
+        # 事件形态见 openai-python response_completed_event.py：
+        #     {"type":"response.completed","sequence_number":N,"response":{...,"usage":{...}}}
+        elif event_type.startswith("response."):
+            inner = event.get("response") or {}
+            # response.created 就带 model，所以 model 能在流一开始就定下来
+            model = inner.get("model") or model
+
+            usage = inner.get("usage")
+            if usage:
+                # 只有终态事件的 usage 是权威终值。中间事件（response.created /
+                # response.in_progress）的 usage 是 null，上面的 if 已经跳过，
+                # 这里的判断是为了万一某网关在中间事件里填了预估值——那种只该
+                # 填补尚为 0 的字段，不能覆盖终值。
+                authoritative = event_type in (
+                    "response.completed",
+                    "response.incomplete",
+                )
+                self.merge_tokens(
+                    tokens,
+                    self.normalize_usage(usage, api_format),
+                    authoritative=authoritative,
+                )
+                if usage_events is not None:
+                    usage_events.append(
+                        f"[{event_type}] {json.dumps(usage, ensure_ascii=False)}"
+                    )
+
         # OpenAI: 最后一个 chunk 的 usage 字段（前面的 chunk 是 null），同样是权威终值
         elif event.get("usage"):
             usage = event["usage"]
@@ -1187,10 +1600,40 @@ def main():
     print("=" * 64)
     print(f"[INFO] TokenScope 代理启动 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-    ProxyHandler.routes = load_routes()
+    domains_config = read_domains_file()
+
+    ProxyHandler.routes = load_routes(domains_config)
     print(f"[INFO] 已加载 {len(ProxyHandler.routes)} 个路由规则")
     for prefix, domain in ProxyHandler.routes.items():
         print(f"       {prefix:12s} → {domain}")
+
+    ProxyHandler.aggregate = load_aggregate(domains_config)
+    if ProxyHandler.aggregate:
+        ProxyHandler.keys = load_keys()
+        warn_if_keys_world_readable()
+
+        aggregate = ProxyHandler.aggregate
+        targets = aggregate["targets"]
+        print(
+            f"[INFO] 聚合路由已启用: {aggregate['prefix']} "
+            f"（{len(targets)} 个 target，{len(aggregate['models'])} 条模型规则）"
+        )
+        for name, conf in targets.items():
+            endpoints = " ".join(
+                f"{bucket}={conf[bucket]}" for bucket in ("anthropic", "openai") if conf.get(bucket)
+            )
+            # 启动时就把缺 key 的 target 点出来，而不是等第一个请求打过来才 400
+            flag = "" if ProxyHandler.keys.get(name) else "  ⚠️ 缺 key"
+            print(f"       {name:12s} {endpoints}{flag}")
+        for pattern, target in aggregate["models"].items():
+            print(f"       {pattern:24s} → {target}")
+        if aggregate["default"]:
+            print(f"       {'(default)':24s} → {aggregate['default']}")
+        else:
+            # 无 default 时，探活等无 body 请求解析不出 model，会直接 400
+            print("       未配置 default，模型匹配不上的请求会返回 400")
+    else:
+        print("[INFO] 聚合路由未启用（配置里没有 aggregate 段）")
 
     # 启动时先清一次过期文件
     for name in purge_old_stats():
