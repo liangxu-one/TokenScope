@@ -293,7 +293,11 @@ struct ContentView: View {
             Text(item.name)
                 .font(.caption2).foregroundStyle(.secondary)
                 .lineLimit(1).truncationMode(.middle)
-                .frame(width: 76, alignment: .leading)
+                // 66 而不是 76：两个窗口都带日期后，这一行最坏情况（三位数百分比
+                // + 十来个字符的渠道名）只剩 1.5pt 余量，太贴边。这里省下的 10pt
+                // 全给右边。66pt 放得下 deepseek / minimax / somevendor 这类名字，
+                // 更长的按中间截断（省略号落在中间，两头的辨识度都还在）。
+                .frame(width: 66, alignment: .leading)
             balanceValue(item.value)
             Spacer(minLength: 0)
         }
@@ -321,7 +325,9 @@ struct ContentView: View {
             }
 
         case let .quota(windows):
-            HStack(spacing: 14) {
+            // 窗口间距 10（原 14）：同样是给右边腾地方。两个窗口之间已经有
+            // 迷你条作视觉分界，10pt 够分得开。
+            HStack(spacing: 10) {
                 ForEach(Array(windows.enumerated()), id: \.offset) { _, window in
                     HStack(spacing: 4) {
                         Text(window.label).font(.system(size: 9)).foregroundStyle(.tertiary)

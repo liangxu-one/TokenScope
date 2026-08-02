@@ -376,7 +376,7 @@ python3 balance.py --min 5       # 货币余额低于 5 则退出码 1，挂 cro
 ```python
 # proxy/balance.py
 
-@provider("myvendor", "api.myvendor.com")      # 可写多个域名片段
+@provider("myvendor", "api.myvendor.com")      # 完整主机名，可写多个
 def query_myvendor(api_key, base_url):
     payload, error = fetch("https://api.myvendor.com/v1/balance", api_key)
     return error or parse_myvendor(payload)
@@ -395,12 +395,26 @@ def parse_myvendor(payload):                    # 与网络分离，便于不联
 | `fetch(url, key, bearer=True)`       | GET JSON。`bearer=False` 时不加 `Bearer ` 前缀（有厂商这么要求） |
 | `parse_number(obj, field)`           | 取数值，**兼容字符串写法**                                        |
 | `millis_to_local(ms)`                | 毫秒时间戳 → 本地时间字符串                                       |
+| `host_of(url)`                       | 取主机名。**要判断上游是哪个站点就用它**，别在原始 URL 上做子串匹配 |
 | `currency(balances, available=True)` | 构造货币余额结果                                                  |
 | `quota(windows)`                     | 构造套餐额度结果（存**已用**百分比）                              |
 | `failure(msg, transient=False)`      | 构造失败。`transient=True` 表示网络类瞬时失败、值得重试           |
 
 建议把解析拆成独立函数（像上面 `parse_myvendor` 那样），这样能不联网写单测 ——
 字段语义的坑基本都只有测试能挡住。
+
+> ⚠️ 传进来的 `base_url` 来自用户的配置文件，**不要拿它去 `in` 判断站点**。
+> `find_provider` 用的是解析出来的主机名，因为下面三种都能骗过子串匹配：
+> `api.deepseek.com.evil.example`（后缀冒充）、
+> `api.deepseek.com@evil.example`（userinfo 冒充，真实主机是 `@` 之后那段）、
+> `evil.example/?upstream=api.deepseek.com`（塞在 query 里）。
+>
+> 内置两家的额度 URL 是写死的，判错只是显示不对；但你的实现若按 `base_url`
+> 拼请求地址，判错就等于把 key 发到配置里写的任意主机上。要判站点用 `host_of`。
+> 这三种形状都钉在 `selftest_usage.py` 里了。
+>
+> 一个渠道配了多个端点（openai + anthropic）时，`base_url` 拿到的是**第一个**，
+> 是个可直接用的完整地址，不是把多个拼起来的字符串。
 
 其他厂商的端点与字段可参考 [cc-switch](https://github.com/farion1231/cc-switch)，
 它覆盖面广得多：
@@ -419,9 +433,9 @@ def parse_myvendor(payload):                    # 与网络分离，便于不联
 
 ```
 ──────────────────────────────────────────────────────────────────
- ⊞ 剩余额度                                            17:33  ↻
- deepseek     ¥10.73
- minimax      5 小时 已用 1% ▁ ⏱20:00   7 天 已用 23% ▃ ⏱08-03 00:00
+ ⊞ 剩余额度                                            18:17  ↻
+ deepseek     ¥11.73
+ minimax      5 小时 已用 1% ▁ ⏱08-02 20:00  7 天 已用 23% ▃ ⏱08-03 00:00
 ──────────────────────────────────────────────────────────────────
 ```
 
@@ -436,7 +450,7 @@ def parse_myvendor(payload):                    # 与网络分离，便于不联
 | 只有套餐额度有进度条             | 货币余额**没有分母**，不知道"满"是多少。那类行右边是空的，不是漏画了     |
 | 金额不按阈值变色                 | 多少算"低"取决于你的消耗速度，编一个阈值只会误导。唯一变红的依据是上游自己标记余额不足 |
 | 已用百分比的配色与命中率**相反** | 命中率越高越好（绿），已用越高越糟（红）。两者都是 0~100 的比率，混用编译器不会报错，只会把颜色配反 |
-| 重置时刻跨天才带日期             | 今天只给 `20:00`，跨天给 `08-03 00:00`。MiniMax 的 7 天窗实测就落在次日 00:00，光显示「00:00」分不清是今天还是明天 |
+| 重置时刻一律带日期、但不带年份   | `08-02 20:00`。不做「今天就省掉日期」的优化：那样两个窗口一个带日期一个不带、看着像没对齐，而且要判断「是不是今天」就得引入当前时间、时区和跨年这几类会算错的东西。年份省掉是因为窗口最长 7 天，`01-01` 只可能是明年元旦；带上年份两个窗口并排放不下（最坏情况右边只剩 13pt） |
 | 货币余额那行右边是空的           | 没有重置周期可显示 —— 钱只能靠充值回升，不会到点自己回来                 |
 | 超过 4 个渠道才出现滚动          | 上限 76pt。绝大多数人遇不到                                              |
 

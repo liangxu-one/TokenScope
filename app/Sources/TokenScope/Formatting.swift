@@ -45,30 +45,26 @@ func timeString(_ date: Date) -> String {
     return f.string(from: date)
 }
 
-/// 只建一次。DateFormatter 的初始化不便宜（约几十微秒），而下面那个函数是在
-/// 视图 body 里被调的 —— 鼠标在面板上动一下就重算一遍，别在那种路径上反复 new。
-private let resetDayFormatter: DateFormatter = {
-    let f = DateFormatter()
-    f.dateFormat = "yyyy-MM-dd"
-    f.timeZone = .current
-    f.locale = Locale(identifier: "en_US_POSIX")
-    return f
-}()
-
-/// 套餐额度的重置时刻，紧凑展示：今天只给时刻，跨天补上日期。
+/// 套餐额度的重置时刻，紧凑展示：`2026-08-03 00:00` → `08-03 00:00`。
 ///
-/// 入参是 balance.py 给的 `yyyy-MM-dd HH:mm`。这里只切字符串、不解析成 Date ——
+/// 入参是 balance.py 给的 `yyyy-MM-dd HH:mm`。只切字符串、不解析成 Date ——
 /// 与 `AiStatsService.hour(from:)` 同一个理由，格式是自家代理写死的。
 ///
-/// ⚠️ 跨天**必须**带上日期。MiniMax 的 7 天窗实测就落在次日 `00:00`，
-/// 只显示「00:00」分不清是今天还是明天 —— 这个歧义是必然撞上的，不是理论情况。
+/// **每个窗口都带日期**，不做「今天就省掉日期」那种优化。省掉过，两个毛病：
+///   1. 两个时刻一个带日期一个不带、宽度也不一样，看着像没对齐
+///   2. 要判断"是不是今天"就得引 DateFormatter、拿当前时间去比，凭空多出
+///      时区和跨年这两类会算错的东西（`YYYY` 与 `yyyy` 写错一个字母，
+///      12 月底就会把年份算成下一年 —— 这类 bug 界面上还看不出来）
+/// 现在这个函数是纯字符串变换，与当前时间、时区、跨年全都无关，
+/// 同样的输入永远得到同样的输出。
+///
+/// 年份**刻意丢掉**：`2027-01-01 00:00` 显示成 `01-01 00:00`。套餐窗口最长
+/// 7 天，跨年时读成"明年元旦"是唯一说得通的解释；而带上年份要 16 个字符，
+/// 两个窗口并排放不下（实测右边只剩 43pt 余量）。
+///
 /// 格式不符时原样返回，宁可显示得长一点也不显示错。
 func formatResetTime(_ resetsAt: String) -> String {
     let parts = resetsAt.split(separator: " ")
     guard parts.count == 2, parts[0].count == 10 else { return resetsAt }
-
-    let day = String(parts[0])
-    let time = String(parts[1])
-    if day == resetDayFormatter.string(from: Date()) { return time }
-    return String(day.dropFirst(5)) + " " + time      // 2026-08-03 → 08-03
+    return String(parts[0].dropFirst(5)) + " " + String(parts[1])
 }
