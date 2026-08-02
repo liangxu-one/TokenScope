@@ -59,6 +59,7 @@ import unicodedata
 import urllib.error
 import urllib.request
 from datetime import datetime
+from urllib.parse import urlsplit
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
@@ -78,13 +79,14 @@ def provider(provider_id, *domains):
     """
     注册一个额度提供方。
 
-    domains 是上游域名片段，命中任意一个即认为该渠道属于本提供方。
+    domains 是**完整主机名**（不是片段），配置里的主机名等于它、或是它的真子域，
+    即认为该渠道属于本提供方。
     被装饰的函数签名为 `query(api_key, base_url) -> dict`，
     返回值用下面 currency() / quota() / failure() 三个构造器生成。
 
-    base_url 传的是该渠道在配置里的上游地址 —— 大多数厂商的额度接口是固定
-    域名、用不到它；但有的厂商（如自建网关、区域域名不同）需要据此拼接，
-    所以统一传进来。
+    base_url 传的是该渠道在配置里的上游地址（有多个端点时传第一个）——
+    大多数厂商的额度接口是固定域名、用不到它；但有的厂商（如自建网关、
+    区域域名不同）需要据此拼接，所以统一传进来。
     """
     def wrap(fn):
         PROVIDERS.append({"id": provider_id, "domains": domains, "query": fn})
@@ -92,12 +94,43 @@ def provider(provider_id, *domains):
     return wrap
 
 
+def host_of(raw):
+    """
+    从配置里的上游地址取出主机名，取不到返回 None。
+
+    用 `hostname` 而不是 `netloc`：后者会把 userinfo 和端口一并带上，
+    而 `https://api.deepseek.com@evil.example/` 的真实主机是 evil.example。
+
+    裸域名（`routes` 里配的就是 `api.deepseek.com` 这种没有 scheme 的形状）
+    要先补 `//`，否则 urlsplit 会把整串当成 path、netloc 为空。
+    """
+    text = str(raw).strip().lower()
+    if "://" not in text:
+        text = "//" + text
+    return urlsplit(text).hostname
+
+
 def find_provider(base_urls):
-    """按域名找提供方。找不到返回 None（调用方应静默跳过）。"""
-    joined = " ".join(base_urls).lower()
+    """
+    按主机名找提供方。找不到返回 None（调用方应静默跳过）。
+
+    ⚠️ 必须比对**解析出来的主机名**，不能拿域名去 `in` 整个 URL 做子串匹配。
+    子串匹配会把下面三种都误判成本家（均已实测）：
+
+        api.deepseek.com.evil.example       后缀冒充
+        api.deepseek.com@evil.example       userinfo 冒充，真实主机是后者
+        evil.example/?x=api.deepseek.com    塞在 query string 里
+
+    内置两家的额度接口 URL 是写死的，判错只是显示不对；但 @provider 会把
+    base_url **交给第三方实现**去拼 URL（上面 provider() 的文档就是这么承诺的），
+    判错就等于把那家的 key 发到配置里写的任意主机上。
+    """
+    hosts = [h for h in (host_of(u) for u in base_urls) if h]
     for entry in PROVIDERS:
-        if any(domain in joined for domain in entry["domains"]):
-            return entry
+        for host in hosts:
+            # 等于，或是真子域：cn.api.deepseek.com 算，api.deepseek.com.x 不算
+            if any(host == d or host.endswith("." + d) for d in entry["domains"]):
+                return entry
     return None
 
 
@@ -279,7 +312,11 @@ def query_minimax(api_key, base_url):
 
     另外它有业务级错误码：HTTP 200 也可能是失败，必须单独查 base_resp。
     """
-    domain = "api.minimax.io" if "minimax.io" in (base_url or "") else "api.minimaxi.com"
+    # 在**解析出的主机名**上判国际站，不在原始 URL 上判 —— 后者会被
+    # query string 里的字样带跑（`?ref=minimax.io`）。走到这里 find_provider
+    # 已经认过主机名，所以它一定是 api.minimaxi.com 或 api.minimax.io（或其子域）。
+    host = host_of(base_url) or ""
+    domain = "api.minimax.io" if "minimax.io" in host else "api.minimaxi.com"
     url = f"https://{domain}/v1/api/openplatform/coding_plan/remains"
 
     payload, error = fetch(url, api_key)
@@ -383,7 +420,13 @@ def collect():
             continue
 
         try:
-            queried = entry["query"](api_key, " ".join(base_urls))
+            # 传**第一个**地址，不是把多个拼成一串。
+            #
+            # 一个渠道有多个端点时（openai + anthropic 各一个 base），拼起来会得到
+            # "https://a.com https://b.com" 这种带空格的伪 URL；第三方实现照
+            # provider() 的承诺拿它去拼请求地址，拼出来的东西是坏的。
+            # 多个端点本来就是同一家的不同协议入口，主机名相同，取第一个即可。
+            queried = entry["query"](api_key, base_urls[0])
         except Exception as e:
             # 第三方自己加的提供方抛异常时，不能让整个查询崩掉
             queried = failure(f"提供方 {entry['id']} 实现抛出异常: {type(e).__name__}: {e}")

@@ -646,6 +646,22 @@ def test_balance_parsing():
     # 用途最广的一类就是自建/私有网关：它们没有公开的额度接口，理应完全不显示。
     check("认不出的域名返回 None",
           find_provider(["https://llm-gateway.internal.example.com/api/anthropic"]), None)
+    # routes 里配的是没有 scheme 的裸域名，这条形状也必须能认
+    check("裸域名（无 scheme）也能认", find_provider(["api.deepseek.com"])["id"], "deepseek")
+    check("大小写不敏感", find_provider(["API.DeepSeek.COM"])["id"], "deepseek")
+    check("带端口不影响", find_provider(["https://api.deepseek.com:8443/v1"])["id"], "deepseek")
+    check("真子域算命中", find_provider(["https://cn.api.deepseek.com"])["id"], "deepseek")
+
+    # ⚠️ 以下三条是本模块最要紧的安全断言。原实现拿域名去 `in` 整个 URL 做子串
+    # 匹配，三种都会被误判成 deepseek（均已实测）。内置两家的额度 URL 写死了，
+    # 判错只是显示不对；但 @provider 会把 base_url 交给第三方实现去拼请求地址，
+    # 判错就等于把那家的 key 发到配置里写的任意主机上。
+    check("后缀冒充不算命中（api.deepseek.com.evil.example）",
+          find_provider(["https://api.deepseek.com.evil.example"]), None)
+    check("userinfo 冒充不算命中（真实主机是 @ 之后那段）",
+          find_provider(["https://api.deepseek.com@evil.example/"]), None)
+    check("query string 里出现域名不算命中",
+          find_provider(["https://evil.example/?upstream=api.deepseek.com"]), None)
     check("已内置两家", sorted(p["id"] for p in PROVIDERS), ["deepseek", "minimax"])
 
 
