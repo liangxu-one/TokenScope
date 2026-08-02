@@ -8,11 +8,26 @@ private struct ListHeightKey: PreferenceKey {
     }
 }
 
+/// 余额区内容的实测高度。
+///
+/// ⚠️ 必须与 `ListHeightKey` 分开，不能两个 ScrollView 共用一个 key。
+/// `reduce` 取的是 `max`，共用的话两处 GeometryReader 会把彼此的高度顶成
+/// 两者中的较大值 —— 结果是余额区跟着明细表一起被撑到 200pt 高。
+private struct BalanceHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
 struct ContentView: View {
     @StateObject private var viewModel = StatsViewModel()
 
     /// 明细行内容撑起来的高度，由 GeometryReader 量出
     @State private var listContentHeight: CGFloat = 0
+
+    /// 余额行内容撑起来的高度，同样由 GeometryReader 量出
+    @State private var balanceContentHeight: CGFloat = 0
 
     var body: some View {
         VStack(spacing: 0) {
@@ -21,6 +36,14 @@ struct ContentView: View {
             TrendChart(points: viewModel.snapshot.hourly)
             Divider()
             statsCards
+            // 没有可查询额度的渠道时整条不出现，一个像素都不占 ——
+            // 与 balance.py 的原则一致：认不出的渠道完全不显示，不打扰。
+            // （注意明细上限从 235 降到 200 是**无条件**的，那部分不用额度的人
+            // 也会受影响，少一行可见明细。理由见 breakdownList 里的说明。）
+            if let balance = viewModel.balance, !balance.items.isEmpty {
+                Divider()
+                balanceStrip(balance)
+            }
             Divider()
             breakdownList
             Divider()
@@ -31,8 +54,15 @@ struct ContentView: View {
         //
         // 高度**不写死**，由内容撑开：写死的话行数少时底部会空一大片
         // （实测 700pt 下只有 2 行渠道，尾部白掉约 87pt）。
-        // 实测窗口高度：2 行 613pt、3 行 656pt、5 行 742pt、6 行及以上 763pt。
-        // 增长上限由明细区那个显式 height 封住，见 breakdownList。
+        //
+        // 实测窗口高度（含余额区、2 个渠道，单行明细 43pt）：
+        //   1 行 636pt　2 行 679　3 行 722　4 行 765　5 行及以上 794（封顶）
+        // 不显示余额区时各减 66pt：1 行 570 … 5 行及以上 728。
+        // 内屏可见高度 949pt，最坏情况 794 占 84%。
+        //
+        // 两处增长都被显式 height 封住：明细区见 breakdownList，
+        // 余额区见 balanceMaxHeight。**不能有第三个可自由伸缩的区域** ——
+        // 那样几个区域会互相抢剩余空间，谁也算不准。
         .frame(width: 480)
         .background(Color(nsColor: .windowBackgroundColor))
         .onAppear { viewModel.startAutoRefresh() }
@@ -135,15 +165,20 @@ struct ContentView: View {
         .padding(EdgeInsets(top: 12, leading: 16, bottom: 12, trailing: 16))
     }
 
+    /// 一张 token 卡。内容**居中**，不是左对齐。
+    ///
+    /// 四张卡等宽平分整行，标题字数却不一样（「新增输入」4 字、「输出」2 字），
+    /// 左对齐时数值会各自贴在自己那格的左边缘、离标题中心一远一近，看着像没对齐。
+    /// 居中之后每格自成一个小单元，与下面「缓存命中率」那条整行卡不冲突。
     private func statCard(icon: String, color: Color, title: String, value: String) -> some View {
-        VStack(alignment: .leading, spacing: 5) {
+        VStack(alignment: .center, spacing: 5) {
             HStack(spacing: 4) {
                 Image(systemName: icon).font(.caption2).foregroundStyle(color)
                 Text(title).font(.caption2).foregroundStyle(.secondary)
             }
             Text(value).font(.callout).fontWeight(.semibold)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(maxWidth: .infinity, alignment: .center)
         .padding(9)
         .background(RoundedRectangle(cornerRadius: 8).fill(Color(nsColor: .controlBackgroundColor)))
     }
@@ -184,6 +219,185 @@ struct ContentView: View {
         if rate >= 60 { return .green }
         if rate >= 30 { return .orange }
         return .red
+    }
+
+    /// 已用百分比配色。
+    ///
+    /// ⚠️ 阈值方向与 `hitRateColor` **相反**，别复用那个：
+    /// 命中率越高越好（高 = 绿），已用比例越高越糟（高 = 红）。
+    /// 两个函数都收 0~100 的 Double，混用编译器不会报错，只会把颜色配反。
+    private func usedColor(_ percent: Double) -> Color {
+        if percent >= 90 { return .red }
+        if percent >= 70 { return .orange }
+        return .green
+    }
+
+    // MARK: - 剩余额度
+    //
+    // 数据来自 BalanceService（跑 `balance.py --json` 子进程），刷新周期与统计
+    // 分开：统计读本地文件 30 秒一次，额度要联网 5 分钟一次。所以这里自带
+    // 抓取时间与刷新按钮 —— 用底部那个「更新于」会让人以为余额也是 30 秒前的。
+
+    /// 余额区上限：4 行内容。
+    ///
+    /// 实测每渠道一行占 17pt，取 76 而不是 68（正好 4 行）是为了让第 5 行露
+    /// 出 8pt —— 与明细表同一个道理：macOS 的滚动条是覆盖式的，不滚动时不显示，
+    /// 卡在整行边界上看起来就像"到此为止了"。
+    /// 4 行以内不会触发滚动，也就是绝大多数人根本遇不到。
+    private static let balanceMaxHeight: CGFloat = 76
+
+    private func balanceStrip(_ balance: BalanceSnapshot) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            // 标题行放在 ScrollView **外面**：渠道多到要滚时，抓取时间和刷新
+            // 按钮不该跟着滚走。
+            HStack(spacing: 6) {
+                Image(systemName: "creditcard").font(.caption2).foregroundStyle(.cyan)
+                Text("剩余额度").font(.caption2).foregroundStyle(.secondary)
+                Spacer()
+                if !balance.shortTime.isEmpty {
+                    // 查询中用淡出表示，不塞 ProgressView —— 小号转圈比 caption2
+                    // 还高，会把整行顶起来，每次刷新窗口都抖一下。
+                    Text(balance.shortTime)
+                        .font(.caption2).foregroundStyle(.tertiary)
+                        .opacity(viewModel.isBalanceLoading ? 0.35 : 1)
+                }
+                Button { viewModel.refreshBalance() } label: {
+                    Image(systemName: "arrow.clockwise").font(.caption2)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.tertiary)
+                .help("立即重新查询各渠道额度（要联网）")
+            }
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(balance.items) { balanceRow($0) }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(
+                    GeometryReader { geo in
+                        Color.clear.preference(key: BalanceHeightKey.self, value: geo.size.height)
+                    }
+                )
+            }
+            // 与明细表同样必须给**显式高度**，理由见 breakdownList 里的长注释：
+            // ScrollView 没有固有内容高度，窗口高度不写死时它会被动吸收差额、塌成 0。
+            .frame(height: min(max(balanceContentHeight, 1), Self.balanceMaxHeight))
+            .onPreferenceChange(BalanceHeightKey.self) { balanceContentHeight = $0 }
+        }
+        .padding(EdgeInsets(top: 9, leading: 16, bottom: 9, trailing: 16))
+    }
+
+    private func balanceRow(_ item: BalanceItem) -> some View {
+        HStack(spacing: 8) {
+            Text(item.name)
+                .font(.caption2).foregroundStyle(.secondary)
+                .lineLimit(1).truncationMode(.middle)
+                .frame(width: 76, alignment: .leading)
+            balanceValue(item.value)
+            Spacer(minLength: 0)
+        }
+        .help(balanceTooltip(item))
+    }
+
+    @ViewBuilder
+    private func balanceValue(_ value: BalanceValue) -> some View {
+        switch value {
+        case let .currency(amounts, available):
+            HStack(spacing: 10) {
+                // 多币种账户各币种独立，**不能相加**，所以并排列出。
+                // 按下标遍历而不是按币种做 id —— 理由见 MoneyAmount 的注释。
+                ForEach(Array(amounts.enumerated()), id: \.offset) { _, amount in
+                    Text(amount.text)
+                        .font(.caption).fontWeight(.semibold)
+                        // 金额不做阈值配色：多少算"低"取决于你的消耗速度，
+                        // 编一个阈值只会误导。唯一变红的依据是上游自己说余额不足。
+                        .foregroundStyle(available ? Color.primary : .red)
+                }
+                if !available {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 8)).foregroundStyle(.red)
+                }
+            }
+
+        case let .quota(windows):
+            HStack(spacing: 14) {
+                ForEach(Array(windows.enumerated()), id: \.offset) { _, window in
+                    HStack(spacing: 4) {
+                        Text(window.label).font(.system(size: 9)).foregroundStyle(.tertiary)
+                        // 必须写"已用" —— 只写 1% 会被读成"只剩 1%"，语义正好反过来
+                        Text("已用 \(Int(window.usedPercent.rounded()))%")
+                            .font(.caption).fontWeight(.semibold)
+                            .foregroundStyle(usedColor(window.usedPercent))
+                        miniBar(window.usedPercent)
+
+                        if let resetsAt = window.resetsAt {
+                            // 时钟图标不是装饰：一个光秃秃的「20:00」跟在进度条后面
+                            // 读不出是什么，可能被当成任何时刻。
+                            HStack(spacing: 2) {
+                                Image(systemName: "clock").font(.system(size: 8))
+                                Text(formatResetTime(resetsAt)).font(.system(size: 9))
+                            }
+                            .foregroundStyle(.tertiary)
+                        }
+                    }
+                }
+            }
+            // 渠道给了 3 个以上窗口时宁可截断也不换行 —— 换行会把行高顶成两倍，
+            // 连带撑破余额区那个 76pt 的封顶。
+            .lineLimit(1)
+
+        case let .failure(message, transient):
+            HStack(spacing: 4) {
+                Image(systemName: transient ? "wifi.slash" : "exclamationmark.circle")
+                    .font(.system(size: 8))
+                Text(message)
+                    .font(.caption2).lineLimit(1).truncationMode(.tail)
+            }
+            // 瞬时失败（网络不通）用灰色：过会儿自己就好了，不值得报警；
+            // 非瞬时（缺 key、鉴权失败）是要你动手改配置的，用橙色。
+            .foregroundStyle(transient ? Color.secondary : Color.orange)
+        }
+    }
+
+    /// 已用比例的迷你条。只有套餐额度画得出来 —— 货币余额没有分母，
+    /// 不知道"满"是多少，所以那类行右边是空的，不是漏了。
+    private func miniBar(_ percent: Double) -> some View {
+        GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                Capsule().fill(Color.secondary.opacity(0.18))
+                Capsule().fill(usedColor(percent))
+                    // 下限 1.5pt：已用 0% 时也留一个点，否则整条看着像没渲染出来
+                    .frame(width: max(geo.size.width * min(percent, 100) / 100, 1.5))
+            }
+        }
+        .frame(width: 26, height: 3)
+    }
+
+    private func balanceTooltip(_ item: BalanceItem) -> String {
+        switch item.value {
+        case let .currency(amounts, available):
+            let money = amounts.map { "\($0.code) \($0.text)" }.joined(separator: "　")
+            return """
+                \(item.name)　货币余额
+                \(money)
+                \(available ? "上游标记为可用" : "⚠️ 上游标记余额不足")
+                货币余额没有重置周期，只能靠充值回升。
+                """
+        case let .quota(windows):
+            let detail = windows.map {
+                "\($0.label)　已用 \(String(format: "%.1f", $0.usedPercent))%　剩余 "
+                    + "\(String(format: "%.1f", 100 - $0.usedPercent))%"
+                    + ($0.resetsAt.map { "　重置于 \($0)" } ?? "")
+            }.joined(separator: "\n")
+            return "\(item.name)　套餐额度（无面值）\n\(detail)"
+        case let .failure(message, transient):
+            // 不再套一层「查询失败」——message 自己就说清了是什么（鉴权失败 /
+            // 网络不可达 / 版本不匹配），外面再加一句反而会把非查询类的问题
+            // 也说成查询失败。
+            return "\(item.name)\n\(message)"
+                + (transient ? "\n网络类瞬时失败，下次刷新会重试。" : "")
+        }
     }
 
     // MARK: - 分组明细
@@ -230,12 +444,19 @@ struct ContentView: View {
                 // 所以先用 GeometryReader 量出行内容的真实高度，再显式设定。
                 // 不写死行高是刻意的：行高取决于字号和 padding，硬编码一个 42
                 // 等于把版面算术又抄一份，改字号就失效。
-                // 上限 235pt：单行 43pt（42 + 分隔线），235 正好显示 5 行半 ——
-                // 第 6 行露出半行，一眼看得出还能往下滚。这个"半行"是必要的：
-                // macOS 的滚动条是覆盖式的，不滚动时不显示，若上限取 220（5.1 行）
-                // 第 6 行只露 4pt，看上去就像列表到此为止了。
-                // 也别取太大：300pt 时 7 行会让窗口到 828pt，占掉内屏可见高度
-                // （949pt）的 87%，菜单栏弹窗顶满屏太夸张。
+                //
+                // 上限 200pt：单行 43pt（42 + 分隔线），200 = 4 整行 + 第 5 行
+                // 露出 28pt。这个"露半行"是必要的：macOS 的滚动条是覆盖式的，
+                // 不滚动时不显示，若上限卡在整行边界（172 = 4 行整、215 = 5 行整）
+                // 或只差一点（220 只露 5pt），看上去就像列表到此为止了。
+                //
+                // 原本是 235pt（5 整行 + 露 20pt），加余额区时降下来的：
+                // 余额区在 2 渠道下占 66pt，明细若仍留 235，6 行以上时窗口会到
+                // 829pt、占掉内屏可见高度（949pt）的 87% —— 那正是当初否掉
+                // 「上限 300pt」的同一个理由。降到 200 后是 794pt / 84%。
+                // 顺带一提 200 的滚动提示（露 28pt）比 235（露 20pt）更明显，
+                // 因为 200 落在一行中间、而 235 刚过行边界。
+                // 唯一的代价：同时可见的明细行数从 5 变 4。
                 ScrollView {
                     VStack(spacing: 0) {
                         ForEach(viewModel.rows) { row in
@@ -249,7 +470,7 @@ struct ContentView: View {
                         }
                     )
                 }
-                .frame(height: min(max(listContentHeight, 1), 235))
+                .frame(height: min(max(listContentHeight, 1), 200))
                 .onPreferenceChange(ListHeightKey.self) { listContentHeight = $0 }
             }
         }

@@ -170,8 +170,26 @@ def print_table(title, buckets, key_label, sort_key=None):
         )
 
 
+def balance_line():
+    """
+    查一行渠道剩余额度。失败返回 None —— 报表的主体是本地 jsonl，
+    额度查不到不该让整份报表出不来。
+    """
+    try:
+        from balance import collect, one_line
+        return one_line(collect()) or None
+    except Exception as e:
+        return f"（查询失败：{type(e).__name__}）"
+
+
 def main():
     args = [a for a in sys.argv[1:] if a]
+
+    # 额度查询要联网，**默认不做** —— 这个工具原本纯读本地文件，
+    # 离线可用、瞬间出结果，不该因为多一行额度就变成每次都等网络。
+    want_balance = "--balance" in args
+    args = [a for a in args if a != "--balance"]
+
     if "--all" in args:
         target = None
         scope = "全部历史"
@@ -193,6 +211,10 @@ def main():
 
     print("=" * 118)
     print(f"AI 代理使用统计  |  范围: {scope}  |  共 {len(records)} 条请求")
+    if want_balance:
+        line = balance_line()
+        if line:
+            print(f"剩余额度  {line}")
     print("=" * 118)
 
     print(f"""

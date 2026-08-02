@@ -26,6 +26,9 @@ venv/
 
 # ── 备份与临时文件
 *.bak
+# 带时间戳的备份（如 ai_stats-2026-08-02.jsonl.bak.162851）——
+# 上面那条 *.bak 匹配不到后缀在 .bak 之后的文件
+*.bak.*
 *.migrated
 *.before_fix
 *.log

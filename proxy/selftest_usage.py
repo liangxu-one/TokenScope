@@ -540,6 +540,115 @@ def test_include_usage_injection():
     check("非流式不注入", "stream_options" in out, False)
 
 
+# -------------------------------------------------------------- 额度解析
+
+def test_balance_parsing():
+    print("\n[12] 额度解析（balance.py）")
+    from balance import PROVIDERS, find_provider, parse_deepseek, parse_minimax
+
+    # DeepSeek：金额是**字符串**。这条是防静默错误的关键 —— 当成数字取会得到
+    # None、余额显示 0，界面上完全看不出来。真实响应就是这个形状。
+    result = parse_deepseek({
+        "is_available": True,
+        "balance_infos": [{"currency": "CNY", "total_balance": "10.73",
+                           "granted_balance": "0.00", "topped_up_balance": "10.73"}],
+    })
+    check("字符串金额被正确解析成数字", result["balances"][0]["total"], 10.73)
+    check("kind 为 currency", result["kind"], "currency")
+    check("币种", result["balances"][0]["currency"], "CNY")
+    # 上面的 fixture 刻意保留了这两个字段（DeepSeek 真会返回），断言的是**不收**：
+    # granted + topped_up 恒等于 total，是同一笔钱的两种切法，多存一份就会漂移。
+    check("赠金/充值不进结果（与 total 冗余）",
+          set(result["balances"][0]) & {"granted", "topped_up"}, set())
+    check("balance 只有币种与总额两个键",
+          sorted(result["balances"][0]), ["currency", "total"])
+
+    check(
+        "多币种账户各自独立成条（不能相加）",
+        len(parse_deepseek({"balance_infos": [
+            {"currency": "CNY", "total_balance": "10.73"},
+            {"currency": "USD", "total_balance": "2.00"},
+        ]})["balances"]),
+        2,
+    )
+    check(
+        "is_available=false 被带出来",
+        parse_deepseek({"is_available": False,
+                        "balance_infos": [{"currency": "CNY", "total_balance": "0"}]})["is_available"],
+        False,
+    )
+    check("缺 balance_infos → 失败而不是空结果",
+          parse_deepseek({"is_available": True})["kind"], "error")
+
+    # MiniMax：三个坑。响应样例取自实测（见 balance.py 里的说明）
+    body = {
+        "model_remains": [
+            {"model_name": "general",
+             "current_interval_remaining_percent": 99,
+             "current_weekly_remaining_percent": 77,
+             "current_interval_status": 1, "current_weekly_status": 1,
+             "end_time": 1785672000000, "weekly_end_time": 1785686400000},
+            # video 百分比恒 100，混进去会把数字冲淡
+            {"model_name": "video",
+             "current_interval_remaining_percent": 100,
+             "current_weekly_remaining_percent": 100,
+             "current_interval_status": 3, "current_weekly_status": 3},
+        ],
+        "base_resp": {"status_code": 0, "status_msg": "success"},
+    }
+    result = parse_minimax(body)
+    check("kind 为 quota（没有金额）", result["kind"], "quota")
+    check("只取 general，跳过 video", len(result["windows"]), 2)
+    # 上游给的是「剩余」99 / 77，本模块统一存「已用」，必须反转成 1 / 23。
+    # 方向搞反不会报错，只会把 1% 显示成 99% —— 这是最容易犯又最难发现的错。
+    check("5 小时窗：剩余 99 → 已用 1", result["windows"][0]["used_percent"], 1)
+    check("7 天窗：剩余 77 → 已用 23", result["windows"][1]["used_percent"], 23)
+    # 标签叫「7 天」不叫「周」：实测该窗口跨度恰好 604800000ms（7×24h），
+    # 是滚动 7 天窗而非自然周，叫「周」会让人以为周一清零
+    check("窗口标签", [w["label"] for w in result["windows"]], ["5 小时", "7 天"])
+    check("重置时间被解析", result["windows"][0]["resets_at"] is not None, True)
+    check("不同时存剩余字段（避免两份漂移）",
+          "remaining_percent" in result["windows"][0], False)
+
+    # 无该限额的套餐：status=3 且剩余恒 100（已用 0），展示出来是假信息
+    no_weekly = json.loads(json.dumps(body))
+    no_weekly["model_remains"][0]["current_weekly_status"] = 3
+    no_weekly["model_remains"][0]["current_weekly_remaining_percent"] = 100
+    check(
+        "current_weekly_status != 1 时不展示 7 天窗（否则是假的已用 0%）",
+        len(parse_minimax(no_weekly)["windows"]),
+        1,
+    )
+
+    # HTTP 200 也可能是业务失败
+    check(
+        "base_resp.status_code != 0 判为失败（即便 HTTP 200）",
+        parse_minimax({"base_resp": {"status_code": 1004, "status_msg": "auth failed"},
+                       "model_remains": []})["kind"],
+        "error",
+    )
+    check(
+        "只有 video 没有 general → 失败而不是空",
+        parse_minimax({"model_remains": [{"model_name": "video",
+                                          "current_interval_remaining_percent": 100}],
+                       "base_resp": {"status_code": 0}})["kind"],
+        "error",
+    )
+
+    # 注册表：域名匹配
+    check("按域名找到 deepseek",
+          find_provider(["https://api.deepseek.com/anthropic"])["id"], "deepseek")
+    check("按域名找到 minimax（国内站）",
+          find_provider(["https://api.minimaxi.com"])["id"], "minimax")
+    check("按域名找到 minimax（国际站）",
+          find_provider(["https://api.minimax.io"])["id"], "minimax")
+    # 认不出的渠道必须返回 None，由调用方静默跳过 —— 不能瞎猜成某一家。
+    # 用途最广的一类就是自建/私有网关：它们没有公开的额度接口，理应完全不显示。
+    check("认不出的域名返回 None",
+          find_provider(["https://llm-gateway.internal.example.com/api/anthropic"]), None)
+    check("已内置两家", sorted(p["id"] for p in PROVIDERS), ["deepseek", "minimax"])
+
+
 def main():
     print("=" * 68)
     print("TokenScope 归一化 / 路由自测")
@@ -556,6 +665,7 @@ def main():
     test_aggregate_routing()
     test_key_injection()
     test_include_usage_injection()
+    test_balance_parsing()
 
     print("\n" + "=" * 68)
     if FAILURES:

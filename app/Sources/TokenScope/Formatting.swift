@@ -44,3 +44,31 @@ func timeString(_ date: Date) -> String {
     f.dateFormat = "HH:mm:ss"
     return f.string(from: date)
 }
+
+/// 只建一次。DateFormatter 的初始化不便宜（约几十微秒），而下面那个函数是在
+/// 视图 body 里被调的 —— 鼠标在面板上动一下就重算一遍，别在那种路径上反复 new。
+private let resetDayFormatter: DateFormatter = {
+    let f = DateFormatter()
+    f.dateFormat = "yyyy-MM-dd"
+    f.timeZone = .current
+    f.locale = Locale(identifier: "en_US_POSIX")
+    return f
+}()
+
+/// 套餐额度的重置时刻，紧凑展示：今天只给时刻，跨天补上日期。
+///
+/// 入参是 balance.py 给的 `yyyy-MM-dd HH:mm`。这里只切字符串、不解析成 Date ——
+/// 与 `AiStatsService.hour(from:)` 同一个理由，格式是自家代理写死的。
+///
+/// ⚠️ 跨天**必须**带上日期。MiniMax 的 7 天窗实测就落在次日 `00:00`，
+/// 只显示「00:00」分不清是今天还是明天 —— 这个歧义是必然撞上的，不是理论情况。
+/// 格式不符时原样返回，宁可显示得长一点也不显示错。
+func formatResetTime(_ resetsAt: String) -> String {
+    let parts = resetsAt.split(separator: " ")
+    guard parts.count == 2, parts[0].count == 10 else { return resetsAt }
+
+    let day = String(parts[0])
+    let time = String(parts[1])
+    if day == resetDayFormatter.string(from: Date()) { return time }
+    return String(day.dropFirst(5)) + " " + time      // 2026-08-03 → 08-03
+}

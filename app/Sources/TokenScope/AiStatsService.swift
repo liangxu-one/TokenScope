@@ -25,7 +25,10 @@ struct AiStatsService {
     /// 3. `~/code/TokenScope/proxy` 作为归位
     ///
     /// 这样仓库整体换位置或 clone 到别的机器都不需要改代码。
-    private static func resolveStatsDirectory() -> String {
+    ///
+    /// 非 private：`BalanceService` 要用同一个目录找 `balance.py`（它和统计文件
+    /// 都在仓库的 `proxy/` 下）。两处各写一套推算逻辑迟早会不一致。
+    static func resolveStatsDirectory() -> String {
         let fm = FileManager.default
 
         if let custom = ProcessInfo.processInfo.environment["TOKENSCOPE_STATS_DIR"],
