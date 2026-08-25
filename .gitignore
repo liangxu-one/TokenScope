@@ -32,6 +32,9 @@ venv/
 *.migrated
 *.before_fix
 *.log
+# 轮转出来的备份（http_proxy.log.1 / .log.2，RotatingFileHandler 的 backupCount=2）——
+# 上面那条 *.log 匹配不到后缀在 .log 之后的文件，同 *.bak.* 那条
+*.log.*
 *.tmp
 
 # ── macOS
