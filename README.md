@@ -371,9 +371,9 @@ python3 balance.py --min 5       # 货币余额低于 5 则退出码 1，挂 cro
 请求**直连上游**，不走本地代理 —— 这不是 LLM 调用，走代理只会往 jsonl 里塞
 无意义的记录。
 
-### 内置只有 DeepSeek 与 MiniMax
+### 内置只有 DeepSeek、MiniMax 与智谱 GLM
 
-刻意只内置这两家：它们是本仓库**实测验证过**的，且正好各代表一种 `kind`，
+刻意只内置这三家：它们是本仓库**实测验证过**的，且正好覆盖两种 `kind`，
 可以直接当模板照抄。
 
 各家余额接口的字段语义差异极大，凭文档照抄而不实测很容易写出「看起来有数字但
@@ -386,6 +386,11 @@ python3 balance.py --min 5       # 货币余额低于 5 则退出码 1，挂 cro
   只会把「已用 1%」显示成「已用 99%」
 - MiniMax 第二个窗口要看 `current_weekly_status == 1` 才算激活，否则是假的 0%
 - MiniMax 有业务级错误码，**HTTP 200 也可能是失败**，必须单独查 `base_resp`
+- 智谱的 `percentage` 是**已用**百分比（用 `usage − remaining` 反推验证过），
+  与 MiniMax 正好相反，**不做反转**。照抄上一家的 `100 − x` 会把「已用 2%」
+  显示成「98%」
+- 智谱窗口类型只认 `limits[].unit`（3=5 小时、6=7 天），不能拿重置时间排序
+  代替 —— 周期末尾每周窗会比 5 小时窗更早重置，时间排序必然把两桶标反
 
 这些结论都钉进了 `selftest_usage.py` 的断言。
 
@@ -429,7 +434,7 @@ def parse_myvendor(payload):                    # 与网络分离，便于不联
 > `api.deepseek.com@evil.example`（userinfo 冒充，真实主机是 `@` 之后那段）、
 > `evil.example/?upstream=api.deepseek.com`（塞在 query 里）。
 >
-> 内置两家的额度 URL 是写死的，判错只是显示不对；但你的实现若按 `base_url`
+> 内置三家的额度 URL 是写死的，判错只是显示不对；但你的实现若按 `base_url`
 > 拼请求地址，判错就等于把 key 发到配置里写的任意主机上。要判站点用 `host_of`。
 > 这三种形状都钉在 `selftest_usage.py` 里了。
 >
@@ -441,7 +446,8 @@ def parse_myvendor(payload):                    # 与网络分离，便于不联
 
 - `src-tauri/src/services/balance.rs` —— 货币余额：StepFun、SiliconFlow、
   OpenRouter、Novita AI 等
-- `src-tauri/src/services/coding_plan.rs` —— 套餐额度：Kimi、智谱、ZenMux 等
+- `src-tauri/src/services/coding_plan.rs` —— 套餐额度：Kimi、ZenMux、
+  智谱 z.ai 国际站等（国内站 open.bigmodel.cn 已内置，无需参考）
 
 > 火山方舟不能照抄：它走控制面 OpenAPI（`open.volcengineapi.com`，不是数据面
 > 推理域名）且强制火山签名 V4，凭据是 **AK/SK 一对**而不是单个 key，

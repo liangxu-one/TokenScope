@@ -34,10 +34,10 @@
 走代理只会往 jsonl 里塞无意义的记录。
 
 --------------------------------------------------------------------------------
-只内置了 DeepSeek 与 MiniMax
+只内置了 DeepSeek、MiniMax 与智谱 GLM
 --------------------------------------------------------------------------------
-刻意只内置这两家：它们是本仓库能**实测验证过**的。各家余额接口的字段语义差异
-极大（见下面两个实现里标注的坑），凭文档照抄而不实测，很容易写出"看起来有数字
+刻意只内置这三家：它们是本仓库能**实测验证过**的。各家余额接口的字段语义差异
+极大（见下面各实现里标注的坑），凭文档照抄而不实测，很容易写出"看起来有数字
 但其实错了"的解析 —— 那比没有这个功能更糟。
 
 要加自己的渠道很简单，照下面 `@provider` 的样子写一个函数即可，详见 README。
@@ -45,7 +45,8 @@
 
     src-tauri/src/services/balance.rs       货币余额：StepFun / SiliconFlow /
                                             OpenRouter / Novita AI 等
-    src-tauri/src/services/coding_plan.rs   套餐额度：Kimi / 智谱 / ZenMux 等
+    src-tauri/src/services/coding_plan.rs   套餐额度：Kimi / ZenMux /
+                                            智谱 z.ai 国际站等
 
 注意火山方舟不能照抄：它走控制面 OpenAPI 且强制火山签名 V4（AK/SK 一对，
 不是单个 key），凭据模型与这里不兼容。
@@ -121,7 +122,7 @@ def find_provider(base_urls):
         api.deepseek.com@evil.example       userinfo 冒充，真实主机是后者
         evil.example/?x=api.deepseek.com    塞在 query string 里
 
-    内置两家的额度接口 URL 是写死的，判错只是显示不对；但 @provider 会把
+    内置三家的额度接口 URL 是写死的，判错只是显示不对；但 @provider 会把
     base_url **交给第三方实现**去拼 URL（上面 provider() 的文档就是这么承诺的），
     判错就等于把那家的 key 发到配置里写的任意主机上。
     """
@@ -365,6 +366,153 @@ def parse_minimax(payload):
     return quota(windows)
 
 
+@provider("glm", "open.bigmodel.cn")
+def query_glm(api_key, base_url):
+    """
+    智谱 GLM 编程套餐 —— 套餐额度型的第三个内置实现，解析逻辑参考
+    cc-switch coding_plan.rs 的 parse_zhipu_token_tiers（该文件里智谱国内站与
+    z.ai 国际站共用同一后端、同一 JSON 形状；z.ai 未实测，故只注册了本仓库
+    实际配置的 open.bigmodel.cn）。
+
+    GET https://open.bigmodel.cn/api/monitor/usage/quota/limit
+    （实测响应形态见 parse_glm 文档）
+
+    三个坑，均已实测钉实：
+
+      1. ⚠️ `percentage` 是**已用**百分比，直接存，不做反转 —— 与 MiniMax 给的
+         「剩余」方向正好相反。照抄上一实现的 100 - x 会静默把「已用 2%」显示成
+         「已用 98%」，不报错、极难发现。验证方法：2026-08-26 实测响应里
+         usage=2000 / remaining=1958 → 已用 42 ≈ 2.1%，对得上 percentage=2；
+         若它是剩余量则 1958/2000≈98%，数值明显自相矛盾。
+      2. 窗口类型**只认 limits[].unit 字段**（3=5 小时窗，6=7 天窗），不能拿
+         nextResetTime 排序代替 —— 周期末尾每周窗会比 5 小时窗更早重置，时间
+         排序在该场景必然把两桶标反（cc-switch issue #3036）。number 也不作
+         判据：周窗的 number 实测出现过 7 与 1 两种取值。
+      3. Authorization **不加 Bearer 前缀**（fetch(bearer=False) 就是为此留的），
+         且 HTTP 200 也可能是业务失败（success=false），要单独查。
+    """
+    payload, error = fetch(
+        "https://open.bigmodel.cn/api/monitor/usage/quota/limit",
+        api_key,
+        bearer=False,
+        headers={"Accept-Language": "en-US,en"},
+    )
+    return error or parse_glm(payload)
+
+
+# 智谱窗口分类只认 unit 字段，标签沿用 MiniMax 那套（依据见 query_glm 的坑 2）
+GLM_WINDOW_LABELS = {3: "5 小时", 6: "7 天"}
+
+
+def classify_glm_window(item):
+    """
+    按 unit 判定限额条目所属窗口。unit 缺失或不识别返回 None，
+    由调用方走重置时间启发式兜底。兼容数字与字符串两种写法。
+    """
+    unit = parse_number(item, "unit")
+    if unit is None:
+        return None
+    return GLM_WINDOW_LABELS.get(int(unit))
+
+
+def parse_glm(payload):
+    """
+    与网络请求分离，便于不联网单测（见 selftest_usage.py）。
+
+    响应形态取自 2026-08-26 对 lite 档套餐的实测：
+
+        {"code": 200, "msg": "...", "success": true,
+         "data": {"level": "lite",
+                  "limits": [{"type": "CREDIT_LIMIT", "unit": 3, "number": 5,
+                              "usage": 2000, "currentValue": 41,
+                              "remaining": 1958, "percentage": 2,
+                              "nextResetTime": 1787776664946}, ...]}}
+
+    type 认 TOKENS_LIMIT 与 CREDIT_LIMIT 两种（tokens 是 token 数量包、credit
+    是积分包，都是本模块意义上的套餐额度），大小写不敏感。
+    老套餐只回一条 5 小时限额，自然降级为单窗口，无需特判。
+
+    level（套餐档位 lite/pro/max…）作为额外键带出；展示侧忽略不认识的键。
+    """
+    payload = payload or {}
+    # 业务级错误通道：HTTP 200 但 success=false。别只看 code 字段 ——
+    # 它是 HTTP 语义的重复，业务失败时是否还在没验证过，不赌。
+    if payload.get("success") is False:
+        msg = payload.get("msg") or "未知错误"
+        return failure(f"业务错误: {msg}")
+
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return failure("响应里没有 data")
+
+    limits = data.get("limits")
+    if not isinstance(limits, list):
+        return failure("data 里没有 limits")
+
+    def entry_of(item):
+        """(resets_at, used_percent)，次序与 minimax 窗口的字段用途对应"""
+        return (
+            millis_to_local(item.get("nextResetTime")),
+            parse_number(item, "percentage"),
+        )
+
+    five_hour = None
+    weekly = None
+    unclassified = []
+
+    for item in limits:
+        if not isinstance(item, dict):
+            continue
+        limit_type = str(item.get("type") or "")
+        if limit_type.upper() not in ("TOKENS_LIMIT", "CREDIT_LIMIT"):
+            continue
+
+        current = entry_of(item)
+        label = classify_glm_window(item)
+        # 同类窗口出现多条时只收第一条（理论上不该发生，防御性）
+        if label == "5 小时" and five_hour is None:
+            five_hour = current
+        elif label == "7 天" and weekly is None:
+            weekly = current
+        else:
+            unclassified.append(current)
+
+    # 兜底启发式（同 cc-switch）：unit 缺失或不识别时才走到这里。
+    # 无 nextResetTime 的条目优先归 5 小时桶 —— 该窗在刚清零等状态下可能没有
+    # 重置时间；其余按重置时间升序依次填进仍空着的槽位。
+    # ⚠️ 这个启发式只在 unit 缺失时出场，它本身会犯坑 2 里说的时间排序错，
+    # 不能反过来用它取代 unit 分类的主路径。
+    unclassified.sort(key=lambda e: (e[0] is not None, e[0] or ""))
+    for current in unclassified:
+        if five_hour is None:
+            five_hour = current
+        elif weekly is None:
+            weekly = current
+        # 智谱当前最多两条限额，多余的忽略
+
+    windows = []
+    for label, slot in (("5 小时", five_hour), ("7 天", weekly)):
+        if slot is None:
+            continue
+        resets_at, used_percent = slot
+        if used_percent is None:
+            continue  # 缺百分比没法诚实展示，宁缺勿假地补 0%
+        windows.append({
+            "label": label,
+            "used_percent": used_percent,
+            "resets_at": resets_at,
+        })
+
+    if not windows:
+        return failure("limits 里没有可展示的 TOKENS/CREDIT 限额条目")
+
+    result = quota(windows)
+    level = data.get("level")
+    if isinstance(level, str) and level:
+        result["level"] = level
+    return result
+
+
 # ============================================================ 汇总
 
 def discover():
@@ -519,7 +667,7 @@ def one_line(result):
         elif entry["kind"] == "quota":
             # 单行里必须写清"已用"，否则 1% 会被读成"只剩 1%"，语义正好反过来
             windows = " ".join(
-                f"{w['label']}{w['used_percent']:.0f}%" for w in entry["windows"]
+                f"{w['label']} {w['used_percent']:.0f}%" for w in entry["windows"]
             )
             parts.append(f"{name} 已用 {windows}")
     return "　·　".join(parts)

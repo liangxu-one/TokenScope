@@ -544,7 +544,7 @@ def test_include_usage_injection():
 
 def test_balance_parsing():
     print("\n[12] 额度解析（balance.py）")
-    from balance import PROVIDERS, find_provider, parse_deepseek, parse_minimax
+    from balance import PROVIDERS, find_provider, one_line, parse_deepseek, parse_minimax
 
     # DeepSeek：金额是**字符串**。这条是防静默错误的关键 —— 当成数字取会得到
     # None、余额显示 0，界面上完全看不出来。真实响应就是这个形状。
@@ -635,6 +635,13 @@ def test_balance_parsing():
         "error",
     )
 
+    # 回归：one_line 曾把标签和数值直接拼接，输出「5 小时6%」这种粘连形态
+    check(
+        "单行摘要里标签与百分比之间有空格",
+        one_line({"targets": {"mm": parse_minimax(body)}}),
+        "mm 已用 5 小时 1% 7 天 23%",
+    )
+
     # 注册表：域名匹配
     check("按域名找到 deepseek",
           find_provider(["https://api.deepseek.com/anthropic"])["id"], "deepseek")
@@ -642,6 +649,10 @@ def test_balance_parsing():
           find_provider(["https://api.minimaxi.com"])["id"], "minimax")
     check("按域名找到 minimax（国际站）",
           find_provider(["https://api.minimax.io"])["id"], "minimax")
+    check("按域名找到 glm（聚合配置里的第一个端点形状）",
+          find_provider(["https://open.bigmodel.cn/api"])["id"], "glm")
+    check("裸域名（routes 里的形状）也能认出 glm",
+          find_provider(["open.bigmodel.cn"])["id"], "glm")
     # 认不出的渠道必须返回 None，由调用方静默跳过 —— 不能瞎猜成某一家。
     # 用途最广的一类就是自建/私有网关：它们没有公开的额度接口，理应完全不显示。
     check("认不出的域名返回 None",
@@ -662,7 +673,106 @@ def test_balance_parsing():
           find_provider(["https://api.deepseek.com@evil.example/"]), None)
     check("query string 里出现域名不算命中",
           find_provider(["https://evil.example/?upstream=api.deepseek.com"]), None)
-    check("已内置两家", sorted(p["id"] for p in PROVIDERS), ["deepseek", "minimax"])
+    check("已内置三家", sorted(p["id"] for p in PROVIDERS), ["deepseek", "glm", "minimax"])
+
+
+def test_glm_parsing():
+    print("\n[13] 智谱 GLM 额度解析（balance.py parse_glm）")
+    from balance import parse_glm
+
+    # 整体形态取自 2026-08-26 对 lite 档套餐的实测（见 balance.py parse_glm 文档）
+    body = {
+        "code": 200, "msg": "Operation successful", "success": True,
+        "data": {
+            "level": "lite",
+            "limits": [
+                # 故意把周窗写在前面：证明窗口次序由 unit 分类决定，
+                # 不依赖响应里的条目顺序
+                {"type": "CREDIT_LIMIT", "unit": 6, "number": 1,
+                 "usage": 10000, "currentValue": 41, "remaining": 9958,
+                 "percentage": 1, "nextResetTime": 1788362827998},
+                {"type": "CREDIT_LIMIT", "unit": 3, "number": 5,
+                 "usage": 2000, "currentValue": 41, "remaining": 1958,
+                 "percentage": 2, "nextResetTime": 1787776664946},
+            ],
+        },
+    }
+    result = parse_glm(body)
+    check("kind 为 quota", result["kind"], "quota")
+    check("套餐档位 level 带出为额外键", result.get("level"), "lite")
+
+    # 本模块最要紧的一条防呆断言：percentage 是**已用**，直接存不反转。
+    # MiniMax 上游给「剩余」需要 100-x，GLM 给的就是「已用」——从那边照抄
+    # 反转逻辑会把已用 2% 显示成 98%，静默出错、界面上看不出来。
+    # 数值自洽性（实测反推）：usage=2000, remaining=1958 → 已用 ≈2.1%，对上 percentage=2
+    check("⚠️ percentage 是已用，原样保留不做反转", result["windows"][0]["used_percent"], 2)
+    check("窗口按 unit 分类排序（5 小时在前，与输入顺序无关）",
+          [w["label"] for w in result["windows"]], ["5 小时", "7 天"])
+    check("重置时间被解析", all(w["resets_at"] is not None for w in result["windows"]), True)
+    check("不同时存剩余字段（避免两份漂移）",
+          any("remaining_percent" in w or "remaining" in w for w in result["windows"]), False)
+
+    # type 过滤：认两种、忽略其他；大小写不敏感
+    filtered = json.loads(json.dumps(body))
+    filtered["data"]["limits"] = [
+        {"type": "tokens_limit", "unit": 3, "percentage": 7, "nextResetTime": 1787776664946},
+        {"type": "SOMETHING_ELSE", "unit": 3, "percentage": 99},
+    ]
+    r = parse_glm(filtered)
+    check("type 大小写不敏感（tokens_limit 也认）",
+          [w["used_percent"] for w in r["windows"]], [7])
+    check("不认识的 type 被跳过而不是凑数",
+          [w["label"] for w in r["windows"]], ["5 小时"])
+
+    # unit 缺失时的兜底启发式：无重置时间的优先归 5 小时桶，
+    # 其余按重置时间升序填空位。时间排序不能当主路径 —— 只在 unit 缺失时出场。
+    no_unit = json.loads(json.dumps(body))
+    no_unit["data"]["limits"] = [
+        # 周窗先重置：若按时间顺序排桶会被标反（cc-switch issue #3036）
+        {"type": "TOKENS_LIMIT", "percentage": 20, "nextResetTime": 1000},
+        {"type": "TOKENS_LIMIT", "percentage": 5},
+        {"type": "TOKENS_LIMIT", "percentage": 80, "nextResetTime": 2000},
+    ]
+    r = parse_glm(no_unit)
+    labels = [(w["label"], w["used_percent"]) for w in r["windows"]]
+    check("unit 缺失：无 reset 的条目归 5 小时桶，其余按 reset 升序",
+          labels, [("5 小时", 5), ("7 天", 20)])
+    check("unit 缺失：多余的条目被丢弃（最多两窗）",
+          len(r["windows"]), 2)
+
+    # unit 是字符串数字也能认（上游字段风格没保证过）
+    str_unit = json.loads(json.dumps(body))
+    str_unit["data"]["limits"] = [{"type": "CREDIT_LIMIT", "unit": "3",
+                                   "percentage": 4, "nextResetTime": 1787776664946}]
+    r = parse_glm(str_unit)
+    check("unit 为字符串数字也被识别",
+          [w["label"] for w in r["windows"]], ["5 小时"])
+
+    # 同类窗口多条只收第一条
+    dup = json.loads(json.dumps(body))
+    dup["data"]["limits"].append({"type": "CREDIT_LIMIT", "unit": 3, "percentage": 50})
+    r = parse_glm(dup)
+    check("同类窗口重复时第一条生效",
+          [w["used_percent"] for w in r["windows"] if w["label"] == "5 小时"], [2])
+
+    # percentage 缺失的条目宁缺勿假地跳过；全都缺失则失败
+    no_pct = json.loads(json.dumps(body))
+    no_pct["data"]["limits"][1].pop("percentage")
+    r = parse_glm(no_pct)
+    check("单条缺 percentage 时跳过该窗，另一窗照常",
+          [w["label"] for w in r["windows"]], ["7 天"])
+    check("所有条目都缺 percentage → 失败而不是空结果",
+          parse_glm({"success": True, "data": {"limits": [
+              {"type": "CREDIT_LIMIT", "unit": 3}]}})["kind"],
+          "error")
+
+    # 错误通道：HTTP 200 但 success=false；缺 data / 缺 limits
+    check("success=false 判为失败并带出 msg",
+          parse_glm({"success": False, "msg": "auth failed"})["error"],
+          "业务错误: auth failed")
+    check("缺 data → 失败", parse_glm({"success": True})["kind"], "error")
+    check("data 里没有 limits → 失败",
+          parse_glm({"success": True, "data": {"level": "pro"}})["kind"], "error")
 
 
 def main():
@@ -682,6 +792,7 @@ def main():
     test_key_injection()
     test_include_usage_injection()
     test_balance_parsing()
+    test_glm_parsing()
 
     print("\n" + "=" * 68)
     if FAILURES:
