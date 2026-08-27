@@ -937,7 +937,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
         stat = {
             "timestamp": datetime.fromtimestamp(started_at).strftime("%Y-%m-%d %H:%M:%S"),
             "provider": provider,
-            "model": model,
+            # 模型名统一小写:不同路径上报大小写不一(如 MiniMax-M3 / minimax-m3),
+            # 不归一的话模型视图会按大小写拆成多行
+            "model": (model or "").lower(),
             "api_format": api_format,
             "path": path,
             "stream": is_stream,
