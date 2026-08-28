@@ -475,6 +475,66 @@ def test_aggregate_routing():
         ProxyHandler.aggregate, ProxyHandler.keys = original_aggregate, original_keys
 
 
+def test_loopback_routing():
+    print("\n[9b] 本机地址路由（is_loopback_target / resolve_route）")
+    from http_proxy import is_loopback_target, load_aggregate
+
+    # 形状依据：真实配置里就有 "/gpt": "127.0.0.1:8317" 这一条，
+    # 修复前它被补成 https:// 导致 SSL WRONG_VERSION_NUMBER（2026-08-28 实测）
+    check("带端口 127.0.0.1:8317", is_loopback_target("127.0.0.1:8317"), True)
+    check("localhost:8317", is_loopback_target("localhost:8317"), True)
+    check("[::1]:8317", is_loopback_target("[::1]:8317"), True)
+    check("127.0.0.0/8 整段（127.9.9.9）", is_loopback_target("127.9.9.9"), True)
+    check("远端域名", is_loopback_target("api.minimaxi.com"), False)
+    # 内网 IP 可能真配了证书（内网网关常见），不按本机处理
+    check("内网 IP 不算本机", is_loopback_target("10.0.0.1:8000"), False)
+    check("普通局域网 IP", is_loopback_target("192.168.1.5"), False)
+
+    handler = _Fake()
+    handler.headers = {"Host": "127.0.0.1:12345"}
+    handler.routes = {"/gpt": "127.0.0.1:8317", "/glm": "open.bigmodel.cn"}
+
+    handler.path = "/gpt/v1/messages"
+    check(
+        "routes 裸写本机地址 → 补 http://",
+        handler.resolve_route("gpt-5.6-sol", "anthropic"),
+        ("gpt", "http://127.0.0.1:8317/v1/messages", None),
+    )
+    handler.path = "/glm/api/anthropic/v1/messages"
+    check(
+        "routes 裸写远端域名 → 仍补 https://",
+        handler.resolve_route("glm-5.3-flash", "anthropic")[1],
+        "https://open.bigmodel.cn/api/anthropic/v1/messages",
+    )
+    handler.path = "/gpt/v1/messages"
+    handler.routes = {"/gpt": "http://127.0.0.1:8317"}
+    check(
+        "配置显式写了 http:// → 原样使用不二次处理",
+        handler.resolve_route("gpt-5.6-sol", "anthropic")[1],
+        "http://127.0.0.1:8317/v1/messages",
+    )
+
+    original_aggregate, original_keys = ProxyHandler.aggregate, ProxyHandler.keys
+    ProxyHandler.aggregate = load_aggregate({
+        "aggregate": {
+            "prefix": "/auto",
+            "targets": {"local": {"openai": "127.0.0.1:8317"}},
+            "models": {"gpt-*": "local"},
+        }
+    })
+    ProxyHandler.keys = {"local": "sk-local"}
+    try:
+        check(
+            "aggregate target 裸写本机地址 → 同样补 http://",
+            _Fake().resolve_aggregate(
+                "/auto/v1/chat/completions", "/auto", "gpt-5.6-sol", "openai"
+            )[1],
+            "http://127.0.0.1:8317/v1/chat/completions",
+        )
+    finally:
+        ProxyHandler.aggregate, ProxyHandler.keys = original_aggregate, original_keys
+
+
 def test_key_injection():
     print("\n[10] 密钥注入（build_upstream_headers）")
 
@@ -789,6 +849,7 @@ def main():
     test_stream_errors()
     test_model_matching()
     test_aggregate_routing()
+    test_loopback_routing()
     test_key_injection()
     test_include_usage_injection()
     test_balance_parsing()

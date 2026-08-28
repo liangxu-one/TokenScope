@@ -208,6 +208,37 @@ def strip_comment_keys(mapping):
     return {k: v for k, v in mapping.items() if not str(k).startswith("_")}
 
 
+def is_loopback_target(domain):
+    """
+    判断配置里写的裸地址（未带协议）是否指向本机。
+
+    本机服务几乎不可能配 TLS 证书，裸写的环回地址若照远端域名一样补 https://，
+    等于拿 TLS 去握手纯 HTTP 服务，实测报 SSL WRONG_VERSION_NUMBER。
+    所以环回地址按 http 转发；配置里显式写了 http:// 的不走这个判断。
+    """
+    text = domain.strip().lower()
+    if text.startswith("["):
+        # IPv6 带端口必须写作 [::1]:8317
+        host = text[1:].split("]", 1)[0]
+    elif text.count(":") == 1:
+        # host:port
+        host = text.split(":", 1)[0]
+    else:
+        host = text
+
+    if host in ("localhost", "::1"):
+        return True
+
+    # 127.0.0.0/8 整段都是环回，不只 127.0.0.1
+    parts = host.split(".")
+    if len(parts) == 4 and parts[0] == "127":
+        try:
+            return all(0 <= int(p) <= 255 for p in parts)
+        except ValueError:
+            return False
+    return False
+
+
 def read_domains_file():
     """
     读取并解析路由配置文件，返回原始 dict。
@@ -576,7 +607,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
         for prefix, domain in self.routes.items():
             if path == prefix or path.startswith(prefix + "/"):
                 if not domain.startswith("http"):
-                    domain = f"https://{domain}"
+                    scheme = "http" if is_loopback_target(domain) else "https"
+                    domain = f"{scheme}://{domain}"
                 stripped_path = path[len(prefix):]
                 if not stripped_path.startswith("/"):
                     stripped_path = "/" + stripped_path
@@ -664,7 +696,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
             )
 
         if not base.startswith("http"):
-            base = f"https://{base}"
+            scheme = "http" if is_loopback_target(base) else "https"
+            base = f"{scheme}://{base}"
         # base 末尾若带斜杠，拼上以 / 开头的 rest 会出现 //
         base = base.rstrip("/")
 

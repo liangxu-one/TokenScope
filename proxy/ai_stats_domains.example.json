@@ -1,7 +1,7 @@
 {
     "_comment": "复制本文件为 ai_stats_domains.json 并填入真实域名。以下划线开头的键一律被忽略，可当注释用。",
 
-    "_routes_comment": "【路径前缀路由】客户端 base URL 写成 http://127.0.0.1:12345/<前缀>，key 由客户端自己带，代理只透传。",
+    "_routes_comment": "【路径前缀路由】客户端 base URL 写成 http://127.0.0.1:12345/<前缀>，key 由客户端自己带，代理只透传。指向本机的服务裸写 127.0.0.1:端口 或 localhost:端口 即可，代理按纯 http 转发（写显式 http://… 也行）；其余裸域名一律按 https 转发。",
     "routes": {
         "/deepseek": "api.deepseek.com",
         "/minimax": "api.minimaxi.com",
