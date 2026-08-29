@@ -23,6 +23,10 @@ private struct BalanceHeightKey: PreferenceKey {
 struct ContentView: View {
     @StateObject private var viewModel = StatsViewModel()
 
+    /// 机器人状态。进程级单例（RobotMonitor.shared），这里只订阅展示 ——
+    /// 弹窗关着的时候它也在跑，轮询与动画都不归这个视图管。
+    @ObservedObject var robot: RobotMonitor
+
     /// 明细行内容撑起来的高度，由 GeometryReader 量出
     @State private var listContentHeight: CGFloat = 0
 
@@ -43,6 +47,9 @@ struct ContentView: View {
     var body: some View {
         VStack(spacing: 0) {
             header
+            if robot.isBusy {
+                busyBanner
+            }
             Divider()
             TrendChart(points: viewModel.snapshot.hourly)
             Divider()
@@ -148,6 +155,39 @@ struct ContentView: View {
             }
         }
         .padding(16)
+    }
+
+    /// 顶部下方的「进行中」横幅。仅机器人忙碌时出现，空闲时整条不渲染、
+    /// 一个像素都不占（与余额区同一条原则）。
+    ///
+    /// 为什么要有一条横幅：菜单栏图标在动，但那是个 18pt 的小图；打开面板的
+    /// 人第一眼想知道的是「现在还有几个请求没完、这一轮跑了多久」，不该让他
+    /// 去猜动画帧。左边的模型名最多带 3 个，多了反而看不过来。
+    private var busyBanner: some View {
+        HStack(spacing: 6) {
+            Circle()
+                .fill(Color.green)
+                .frame(width: 7, height: 7)
+            Text(robot.activeRequests.isEmpty
+                ? "回合进行中"
+                : "进行中 · \(robot.activeRequests.count) 个请求")
+                .font(.caption)
+                .fontWeight(.medium)
+            if let elapsed = robot.elapsedText {
+                Text(elapsed)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Text(robot.activeRequests.prefix(3).map(\.model).joined(separator: " · "))
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 7)
+        .background(Color.green.opacity(0.08))
     }
 
     /// 徽标：图标 + 标签在上、数值在下，数值贴右。

@@ -2,6 +2,9 @@
 ai_stats-*.jsonl
 *.jsonl
 
+# ── 实时状态广播（菜单栏机器人轮询的文件，纯运行时产物）
+ai_status.json
+
 # ── 抓包报文（含明文对话内容，绝不入库）
 captures/
 
