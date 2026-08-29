@@ -60,7 +60,7 @@ final class StatusItemController: NSObject, NSPopoverDelegate {
             keyEquivalent: "q"
         )
 
-        let hosting = NSHostingController(rootView: ContentView(robot: robot))
+        let hosting = NSHostingController(rootView: ContentView())
         // 弹窗高度随内容变化（忙碌横幅出现/消失）自动调整，
         // 不用手算 contentSize
         hosting.sizingOptions = .preferredContentSize
@@ -80,8 +80,10 @@ final class StatusItemController: NSObject, NSPopoverDelegate {
         button.sendAction(on: [.leftMouseUp, .rightMouseUp])
 
         // 机器人状态 → 图标与计时文本。Combine 的 sink 闭包不在主 actor 上，
-        // 用 Task 跳回来；8fps 的节奏下这一次 hop 毫无感知
-        robot.$frameIndex
+        // 用 Task 跳回来；8fps 的节奏下这一次 hop 毫无感知。
+        // 帧走 robot.frames 专用管道而不是 $frameIndex —— 帧不是 @Published
+        // （理由见 RobotMonitor 属性注释），全应用只有这里逐帧消费
+        robot.frames
             .sink { [weak self] _ in self?.refreshVisualsOnMain() }
             .store(in: &cancellables)
         robot.$isBusy

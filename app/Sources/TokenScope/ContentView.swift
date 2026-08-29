@@ -23,10 +23,6 @@ private struct BalanceHeightKey: PreferenceKey {
 struct ContentView: View {
     @StateObject private var viewModel = StatsViewModel()
 
-    /// 机器人状态。进程级单例（RobotMonitor.shared），这里只订阅展示 ——
-    /// 弹窗关着的时候它也在跑，轮询与动画都不归这个视图管。
-    @ObservedObject var robot: RobotMonitor
-
     /// 明细行内容撑起来的高度，由 GeometryReader 量出
     @State private var listContentHeight: CGFloat = 0
 
@@ -47,9 +43,10 @@ struct ContentView: View {
     var body: some View {
         VStack(spacing: 0) {
             header
-            if robot.isBusy {
-                busyBanner
-            }
+            // 机器人状态只让横幅这个小视图观察（RobotBannerView 内部说明）。
+            // 走 RobotMonitor.shared 取，不经属性传递 —— 属性传递会诱使这里
+            // 挂 @ObservedObject，整个面板又跟着机器人的发布节奏重绘了。
+            RobotBannerView(robot: .shared)
             Divider()
             TrendChart(points: viewModel.snapshot.hourly)
             Divider()
@@ -157,40 +154,56 @@ struct ContentView: View {
         .padding(16)
     }
 
-    /// 顶部下方的「进行中」横幅。仅机器人忙碌时出现，空闲时整条不渲染、
-    /// 一个像素都不占（与余额区同一条原则）。
-    ///
-    /// 为什么要有一条横幅：菜单栏图标在动，但那是个 18pt 的小图；打开面板的
-    /// 人第一眼想知道的是「现在还有几个请求没完、这一轮跑了多久」，不该让他
-    /// 去猜动画帧。左边的模型名最多带 3 个，多了反而看不过来。
-    private var busyBanner: some View {
-        HStack(spacing: 6) {
-            Circle()
-                .fill(Color.green)
-                .frame(width: 7, height: 7)
-            Text(robot.activeRequests.isEmpty
-                ? "回合进行中"
-                : "进行中 · \(robot.activeRequests.count) 个请求")
-                .font(.caption)
-                .fontWeight(.medium)
-            if let elapsed = robot.elapsedText {
-                Text(elapsed)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            Spacer()
-            Text(robot.activeRequests.prefix(3).map(\.model).joined(separator: " · "))
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-                .lineLimit(1)
-                .truncationMode(.tail)
-        }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 7)
-        .background(Color.green.opacity(0.08))
-    }
+    /// 顶部下方的「进行中」横幅。已整体挪进下面的 `RobotBannerView` ——
+    /// 机器人状态只有这一小块该重绘，不能再让全面板陪着跳（见该视图注释）。
 
-    /// 徽标：图标 + 标签在上、数值在下，数值贴右。
+    /// 顶部下方的「进行中」横幅。**全应用唯一**观察 RobotMonitor 的视图。
+///
+/// 为什么要单独一个视图：RobotMonitor 的发布（横幅文本每秒、在途列表按需）
+/// 会触发所有观察它的视图重绘。这东西以前挂在 ContentView 根上，等于整个
+/// 面板（趋势图、指标卡、明细列表）跟着机器人的节奏全量重绘 —— 忙碌时
+/// 叠加动画帧，主线程被吃满，30 秒的统计定时器都被拖到迟迟不执行
+/// （2026-08-29「面板卡 + 统计迟迟不刷新」的另一半根因）。现在只有这一条
+/// 横幅跟着跳，面板其余部分只在统计快照/余额真变化时才动。
+///
+/// 空闲时返回空 —— 整条不渲染、一个像素都不占（与余额区同一条原则）。
+/// 为什么要有一条横幅：菜单栏图标在动，但那是个 18pt 的小图；打开面板的
+/// 人第一眼想知道的是「现在还有几个请求没完、这一轮跑了多久」，不该让他
+/// 去猜动画帧。左边的模型名最多带 3 个，多了反而看不过来。
+struct RobotBannerView: View {
+    @ObservedObject var robot: RobotMonitor
+
+    var body: some View {
+        if robot.isBusy {
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(Color.green)
+                    .frame(width: 7, height: 7)
+                Text(robot.activeRequests.isEmpty
+                    ? "回合进行中"
+                    : "进行中 · \(robot.activeRequests.count) 个请求")
+                    .font(.caption)
+                    .fontWeight(.medium)
+                if let elapsed = robot.elapsedText {
+                    Text(elapsed)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Text(robot.activeRequests.prefix(3).map(\.model).joined(separator: " · "))
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 7)
+            .background(Color.green.opacity(0.08))
+        }
+    }
+}
+
+/// 徽标：图标 + 标签在上、数值在下，数值贴右。
     ///
     /// 文字块用 .trailing，于是块内较窄的那行被推到右边。常态下标签比数值宽，
     /// 效果就是「标签不动、数值贴右」；反过来数值更宽时（如请求数带失败计数

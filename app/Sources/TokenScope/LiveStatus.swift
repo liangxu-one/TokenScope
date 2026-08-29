@@ -6,7 +6,9 @@ import Foundation
 /// epoch 浮点时间戳是两个进程共享的「现在」，不涉及时区与格式化 ——
 /// 这是它与 jsonl 统计里字符串时间戳（`2026-08-29 12:00:00`）刻意的不同。
 struct LiveStatusSnapshot: Codable {
-    struct Request: Codable {
+    /// Equatable：RobotMonitor 轮询时用「值没变就不发 objectWillChange」
+    /// 压掉面板的空转重绘（2026-08-29 卡顿修复的一半）。
+    struct Request: Codable, Equatable {
         let provider: String
         let model: String
         let stream: Bool

@@ -34,11 +34,25 @@ final class RobotMonitor: ObservableObject {
     }
 
     // MARK: 发布给状态栏与横幅的状态
+    //
+    // ⚠️ 这四个 @Published 的每个**赋值**（哪怕值没变）都会触发 objectWillChange，
+    // 而 ContentView 侧的观察者会整个面板全量重绘（趋势图、渠道列表都在里面）。
+    // 所以这里有三条纪律：
+    //   1. 只在值真正变化时才赋值（见 apply() 里的守卫）；
+    //   2. 高频信号（动画帧）绝不挂 @Published，走下面的 frames 管道；
+    //   3. 面板侧只允许最小的子视图观察 RobotMonitor（见 RobotBannerView）。
 
     /// 机器人是否工作中（含回合尾巴，见 `LiveStatusSnapshot.isBusy`）
     @Published private(set) var isBusy = false
-    /// 当前动画帧下标（busyFrames 的下标）
-    @Published private(set) var frameIndex = 0
+    /// 当前动画帧下标（busyFrames 的下标）。
+    ///
+    /// ⚠️ **刻意不是 @Published**：忙碌时它以 12.5fps 变化，挂上去等于让整个
+    /// 统计面板跟着动画帧率全量重绘 —— 2026-08-29「面板卡、统计迟迟不刷新」
+    /// 的根因。全应用只有菜单栏图标消费帧，走 `frames` 管道点对点送达。
+    private(set) var frameIndex = 0
+    /// 动画帧管道。`StatusItemController` 订阅它逐帧换图标。
+    private let frameSubject = PassthroughSubject<Int, Never>()
+    var frames: AnyPublisher<Int, Never> { frameSubject.eraseToAnyPublisher() }
     /// 回合计时文本，如 `1m 32s`。nil = 空闲，不显示
     @Published private(set) var elapsedText: String?
     /// 当前在途请求明细，供弹窗横幅展示
@@ -90,7 +104,12 @@ final class RobotMonitor: ObservableObject {
 
     private func apply(_ snapshot: LiveStatusSnapshot?, now: Date) {
         let busy = snapshot?.isBusy(now: now.timeIntervalSince1970) ?? false
-        activeRequests = snapshot?.requests ?? []
+        // 等值守卫：@Published 赋等值也触发 objectWillChange，无条件赋值会让
+        // 面板以轮询频率（2Hz）空转重绘 —— 空闲时也不例外。必须只在真变了时赋。
+        let requests = snapshot?.requests ?? []
+        if requests != activeRequests {
+            activeRequests = requests
+        }
 
         if busy != isBusy {
             isBusy = busy
@@ -102,13 +121,17 @@ final class RobotMonitor: ObservableObject {
             }
         }
 
+        let text: String?
         if busy, let turnStart = snapshot?.turnStart {
             // 回合计时从回合起点起算：回合尾巴（最后一个响应已回来、但安静窗口
             // 未过）期间继续走表，下一个请求若在窗口内进来，计时不归零 ——
             // 这正是「同一回合」语义在 UI 上的体现。
-            elapsedText = formatTurnElapsed(max(now.timeIntervalSince1970 - turnStart, 0))
+            text = formatTurnElapsed(max(now.timeIntervalSince1970 - turnStart, 0))
         } else {
-            elapsedText = nil
+            text = nil
+        }
+        if text != elapsedText {
+            elapsedText = text
         }
     }
 
@@ -120,6 +143,8 @@ final class RobotMonitor: ObservableObject {
         animTimer = scheduledTimer(Self.animationInterval) { [weak self] in
             guard let self else { return }
             self.frameIndex = (self.frameIndex + 1) % CrabIcon.busyFrameCount
+            // 帧不进 @Published（理由见属性注释），只点对点喂给菜单栏图标
+            self.frameSubject.send(self.frameIndex)
         }
     }
 
