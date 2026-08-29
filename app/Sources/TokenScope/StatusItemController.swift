@@ -14,13 +14,18 @@ import Combine
 /// `onAppear`/`onDisappear` 在 popover 显示/关闭时照常触发，
 /// 统计轮询的启停时机与 MenuBarExtra 时代一致。
 @MainActor
-final class StatusItemController: NSObject {
+final class StatusItemController: NSObject, NSPopoverDelegate {
 
     private let robot: RobotMonitor
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let popover = NSPopover()
     private var cancellables: Set<AnyCancellable> = []
     private let contextMenu = NSMenu()
+    /// 面板外的点击监视器（showPopover 装，popoverDidClose 拆）。Any 是
+    /// NSEvent.addGlobalMonitorForEvents 的返回类型，没有更具体的类型可写
+    private var outsideClickMonitor: Any?
+    /// 应用失活通知的观察者，生命周期同上
+    private var resignActiveObserver: NSObjectProtocol?
     /// 「Clawd 小螃蟹」开关项。留着引用是为了切换后当场改勾选态 ——
     /// 菜单是常驻对象，不重建，勾选态跟着偏好走
     private let crabItem = NSMenuItem()
@@ -62,6 +67,8 @@ final class StatusItemController: NSObject {
         popover.contentViewController = hosting
         // 点外面自动收起 —— 与 MenuBarExtra(.window) 的行为一致
         popover.behavior = .transient
+        // 关闭时拆掉外面那两道监视器（见 showPopover）
+        popover.delegate = self
 
         guard let button = statusItem.button else { return }
         button.image = CrabIcon.idle
@@ -137,14 +144,71 @@ final class StatusItemController: NSObject {
             // 直接 show 会闪一下旧面板再弹新的
             popover.performClose(nil)
         } else if let button = statusItem.button {
-            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+            showPopover(relativeTo: button)
         }
     }
 
     @objc private func showPanel() {
         if let button = statusItem.button, !popover.isShown {
-            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+            showPopover(relativeTo: button)
         }
+    }
+
+    /// 弹出面板，并装上「点外面必收」的多重保险。
+    ///
+    /// 为什么不能只靠 `popover.behavior = .transient`：transient 的收起由
+    /// key window 的 resign 事件驱动，而本应用是 .accessory —— 2026-08-29
+    /// 实测即使先 `NSApp.activate()`，面板仍可能不收。旧版 MenuBarExtra
+    /// 是自己装监视器实现收起的，所以没这问题。这里对齐那个行为，
+    /// 不再单纯依赖系统机制：
+    ///
+    /// 1. 全局事件监视器：本应用之外任何左/右键按下 → 收面板。面板内点击和
+    ///    状态项点击都投递给本应用、不触发全局监视器，不会误收。
+    /// 2. 应用失活通知：cmd-tab 等不走鼠标的切换也能收。
+    /// 3. NSPopover 自己的 transient 行为保留着，能收的场景照常收。
+    ///
+    /// 监视器的生命周期跟面板走：弹出时装，popoverDidClose 统一拆。
+    private func showPopover(relativeTo button: NSStatusBarButton) {
+        NSApp.activate()
+        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+
+        if outsideClickMonitor == nil {
+            outsideClickMonitor = NSEvent.addGlobalMonitorForEvents(
+                matching: [.leftMouseDown, .rightMouseDown]
+            ) { [weak self] _ in
+                Task { @MainActor [weak self] in self?.closePanelFromOutside() }
+            }
+        }
+        if resignActiveObserver == nil {
+            resignActiveObserver = NotificationCenter.default.addObserver(
+                forName: NSApplication.didResignActiveNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                self?.closePanelFromOutside()
+            }
+        }
+    }
+
+    private func closePanelFromOutside() {
+        guard popover.isShown else { return }
+        popover.performClose(nil)
+    }
+
+    private func teardownPanelWatchers() {
+        if let monitor = outsideClickMonitor {
+            NSEvent.removeMonitor(monitor)
+            outsideClickMonitor = nil
+        }
+        if let observer = resignActiveObserver {
+            NotificationCenter.default.removeObserver(observer)
+            resignActiveObserver = nil
+        }
+    }
+
+    /// 面板关闭（无论哪条路径触发）都把监视器拆干净，不留常驻全局监视器
+    func popoverDidClose(_ notification: Notification) {
+        teardownPanelWatchers()
     }
 
     /// 小螃蟹开关。关 = 完全停（轮询、动画、横幅、计时全没），回到纯统计工具；
