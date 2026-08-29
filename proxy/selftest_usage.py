@@ -15,6 +15,8 @@
 import json
 import os
 import sys
+import tempfile
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -835,6 +837,70 @@ def test_glm_parsing():
           parse_glm({"success": True, "data": {"level": "pro"}})["kind"], "error")
 
 
+# ------------------------------------------------------------ 实时状态广播
+
+def test_live_status():
+    print("\n[14] 实时状态广播（LiveStatus）")
+    from http_proxy import LIVE_STATUS_QUIET_SECONDS, LiveStatus
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        st = LiveStatus(os.path.join(tmpdir, "ai_status.json"))
+
+        # 初始状态：没请求过时 turn_start 必须是 None，不能是 0 或当前时间 ——
+        # app 拿它算计时，不该在从未有过请求时凭空出现一个回合
+        check("初始 in_flight 为 0", st._in_flight, 0)
+        check("初始 turn_start 为 None", st._turn_start, None)
+
+        # begin/end 计数
+        r1 = st.begin("deepseek", "DeepSeek-Chat", False)
+        r2 = st.begin("MiniMax", "MiniMax-M3", True)
+        check("两个并发请求 in_flight=2", st._in_flight, 2)
+        check("模型名统一小写（与落盘统计同一规则）",
+              [r["model"] for r in st._requests.values()],
+              ["deepseek-chat", "minimax-m3"])
+
+        st.end(r1)
+        check("end 一个后 in_flight=1", st._in_flight, 1)
+        st.end(r1)  # 重复 end 必须是安全的空操作
+        check("重复 end 不改变状态", st._in_flight, 1)
+        st.end(r2)
+        check("全部 end 后归零", st._in_flight, 0)
+        check("end 后 requests 清空", st._requests, {})
+
+        # 回合语义：间隙 < QUIET 视为同一回合，计时器沿用原起点
+        first_turn = st._turn_start
+        st._last_activity = time.time() - (LIVE_STATUS_QUIET_SECONDS - 5)
+        st.begin("deepseek", "deepseek-chat", False)
+        check("安静窗口内的下一个请求沿用同一回合", st._turn_start, first_turn)
+        st.end(3)
+
+        # 回合语义：间隙 > QUIET 开新回合
+        st._last_activity = time.time() - (LIVE_STATUS_QUIET_SECONDS + 60)
+        st.begin("deepseek", "deepseek-chat", False)
+        check("超时后的新请求开启新回合", st._turn_start > first_turn, True)
+        st.end(4)
+
+        # touch() 在空闲时绝不能刷新 _last_activity：那会人为拉长安静窗口，
+        # 让机器人在没人干活时多活一口气
+        idle_activity = st._last_activity
+        st.touch()
+        check("空闲时 touch() 不刷新活跃时刻", st._last_activity, idle_activity)
+
+        # 落盘内容与原子性（begin 一个在途请求再读文件，requests 才有内容可断言）
+        st.begin("deepseek", "deepseek-chat", True)
+        check("写完不残留 .tmp 半成品", os.path.exists(st.path + ".tmp"), False)
+        with open(st.path, encoding="utf-8") as f:
+            payload = json.load(f)
+        check("字段齐全（app 侧解码依赖这些键名）",
+              sorted(payload.keys()),
+              ["in_flight", "last_activity", "pid", "requests",
+               "turn_start", "updated_at"])
+        check("requests 里的条目带 provider/model/stream/started",
+              sorted(payload["requests"][0].keys()),
+              ["model", "provider", "started", "stream"])
+        check("在途数落进文件", payload["in_flight"], 1)
+
+
 def main():
     print("=" * 68)
     print("TokenScope 归一化 / 路由自测")
@@ -854,6 +920,7 @@ def main():
     test_include_usage_injection()
     test_balance_parsing()
     test_glm_parsing()
+    test_live_status()
 
     print("\n" + "=" * 68)
     if FAILURES:

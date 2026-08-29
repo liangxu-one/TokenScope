@@ -153,6 +153,31 @@ HOP_BY_HOP_HEADERS = {
     "upgrade",
 }
 
+# ----- 实时状态广播（菜单栏小机器人）-----
+
+# 状态文件路径。菜单栏应用按 0.5 秒轮询它来判断「有没有请求在途」。
+# 用文件而不是 socket/端口：app 侧已有按目录读文件的整套基建（统计、额度都这么做），
+# 且这个文件不到 1KB、最多每秒写一次，轮询成本可以忽略。
+LIVE_STATUS_FILE = os.path.join(SCRIPT_DIR, "ai_status.json")
+
+# 两次请求之间的间隙短于这个值仍算同一「回合」。
+# 代理看不到工具在本地执行的过程（那没有网络流量），只能用间隙时长去猜
+# 「这轮还没完」：间隙 15 秒内的下一个请求，计时器继续沿用回合起点；
+# 超过 15 秒的静默则视为回合结束、机器人休息。工具一跑几分钟的场景机器人
+# 会中途歇下来——这是代理视角的固有边界，只有 Claude Code hooks 才能补齐。
+LIVE_STATUS_QUIET_SECONDS = 15
+
+# 忙碌期间状态文件的节流写间隔（秒）。流式 chunk 每秒可能来几十个，
+# 全都落盘毫无意义；「还在动」这个信号 1 秒一次足够了。
+# begin/end 不受此限制——那是状态真变了，必须立刻让 app 看见。
+LIVE_STATUS_WRITE_INTERVAL = 1.0
+
+# 忙碌期间的心跳间隔（秒）。覆盖「等上游首字节」的长静默：urlopen 最长可等
+# UPSTREAM_TIMEOUT（300 秒）才吐第一个字节，期间流式循环没有 chunk 可触发
+# touch()。没有心跳的话，app 侧的 staleness 判定窗口就得放宽到 300 秒以上，
+# 代理真崩了机器人也要多「忙」5 分钟才肯睡。
+LIVE_STATUS_HEARTBEAT_SECONDS = 5
+
 
 def setup_logging():
     """
@@ -557,6 +582,128 @@ class Decompressor:
         except zlib.error:
             self.supported = False
             return b""
+
+
+class LiveStatus:
+    """
+    把「当前有没有 LLM 请求在途」广播给菜单栏应用。
+
+    状态写在 LIVE_STATUS_FILE（ai_status.json）里，菜单栏应用 0.5 秒轮询一次。
+    语义：
+
+    - **在途（in_flight）**：正在转发中的请求数，机器人动画的直接依据。
+    - **回合（turn_start）**：近似 claude-status-bar 的 turn —— 从第一个请求起，
+      只要间隙不超过 LIVE_STATUS_QUIET_SECONDS 就算同一回合，计时器一直从
+      turn_start 起算。回合的结束是**惰性判定**的：空闲时不用定时器去清零，
+      而是下一个请求到来时看间隙是否超时来决定要不要开新回合。
+    - **新鲜度（updated_at）**：配合 app 侧的 staleness 检查。忙碌期间有
+      心跳线程兜底（见 LIVE_STATUS_HEARTBEAT_SECONDS），app 发现
+      updated_at 过旧且 in_flight > 0 就强制判空闲 —— 代理崩溃后机器人
+      不会永远「忙」下去。
+
+    写入是原子的（tmp + os.replace）：app 的轮询是随机的，绝不能读到半行 JSON。
+    """
+
+    def __init__(self, path=LIVE_STATUS_FILE):
+        self.path = path
+        self._lock = threading.Lock()
+        self._in_flight = 0
+        self._turn_start = None
+        self._last_activity = None
+        # 请求 id → {provider, model, stream, started}。id 只是 begin() 的返回值、
+        # end() 的凭据，用自增整数而不是 id(self)：线程对象可能被复用，不可靠。
+        self._requests = {}
+        self._next_id = 0
+        self._last_write = 0.0
+
+    def begin(self, provider, model, stream):
+        """登记一个在途请求，返回传给 end() 的凭据"""
+        now = time.time()
+        with self._lock:
+            if self._in_flight == 0:
+                gap = None if self._last_activity is None else now - self._last_activity
+                if gap is None or gap > LIVE_STATUS_QUIET_SECONDS:
+                    self._turn_start = now
+            self._in_flight += 1
+            self._last_activity = now
+            self._next_id += 1
+            req_id = self._next_id
+            # 模型名与落盘统计同样统一小写：这里不归一，横幅里的模型名就会
+            # 和明细表对不上（同一处历史问题的两个出口）
+            self._requests[req_id] = {
+                "provider": provider,
+                "model": (model or "").lower(),
+                "stream": bool(stream),
+                "started": now,
+            }
+            self._write_locked(now)
+        return req_id
+
+    def end(self, req_id):
+        """注销一个在途请求。凭据无效（重复 end / 未知 id）时静默忽略"""
+        now = time.time()
+        with self._lock:
+            if self._requests.pop(req_id, None) is None:
+                return
+            self._in_flight = len(self._requests)
+            self._last_activity = now
+            self._write_locked(now)
+
+    def touch(self):
+        """
+        刷新活跃时刻（流式 chunk 到达、心跳线程调用），仅忙碌时有效。
+
+        空闲时调用**不能**刷新 _last_activity：那会人为拉长回合的安静窗口，
+        让机器人多活一口气。
+        """
+        now = time.time()
+        with self._lock:
+            if self._in_flight <= 0:
+                return
+            self._last_activity = now
+            if now - self._last_write >= LIVE_STATUS_WRITE_INTERVAL:
+                self._write_locked(now)
+
+    def write(self):
+        """无条件落一次当前状态（关停时用）"""
+        with self._lock:
+            self._write_locked(time.time())
+
+    def _write_locked(self, now):
+        """写状态文件。调用方必须已持有 _lock"""
+        payload = {
+            "pid": os.getpid(),
+            "in_flight": self._in_flight,
+            "turn_start": self._turn_start,
+            "last_activity": self._last_activity,
+            "updated_at": now,
+            "requests": list(self._requests.values()),
+        }
+        tmp = self.path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False)
+            os.replace(tmp, self.path)
+        except OSError as e:
+            # 状态广播失败不该影响转发主流程，打一条日志就够了
+            print(f"[WARN] 写入实时状态失败: {e}", flush=True)
+        self._last_write = now
+
+
+# 进程级单例。请求生命周期遍布 ProxyHandler 的各个方法，挂类属性和挂模块级
+# 没有本质区别，但 selftest 里可以随手 new 一个临时路径的实例来做纯逻辑测试。
+live_status = LiveStatus()
+
+
+def _live_status_heartbeat():
+    """
+    忙碌期间定时保活，覆盖「等上游首字节」的长静默 —— 流式循环要收到第一个
+    chunk 才会 touch()，而 urlopen 最长可以等 UPSTREAM_TIMEOUT 才吐首字节。
+    touch() 内部自带 in_flight > 0 的守卫，空闲时这个循环是纯空转。
+    """
+    while True:
+        time.sleep(LIVE_STATUS_HEARTBEAT_SECONDS)
+        live_status.touch()
 
 
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
@@ -1181,6 +1328,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
             f"格式: {api_format} | 流式: {is_stream}"
         )
 
+        # 广播「有请求在途」。只登记有真实模型的请求：探活（/api/hello 之类）
+        # 与解析不出 body 的请求不是 LLM 调用，机器人为之闪一下纯属误导 ——
+        # 与 record() 跳过 UNKNOWN_MODEL 不落盘是同一条判据。
+        live_req = None
+        if model != UNKNOWN_MODEL:
+            live_req = live_status.begin(provider, model, is_stream)
+
         headers = self.build_upstream_headers(len(request_body), auth=auth)
 
         capture = None
@@ -1331,6 +1485,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 error=e,
             )
 
+        finally:
+            # 结束广播必须放 finally 而不是挂在 record() 里：客户端提前断开的
+            # 分支（上面第三个 except）不调 record()，漏在这里计数就永久泄漏，
+            # 机器人从此长忙不睡。
+            if live_req is not None:
+                live_status.end(live_req)
+
     # ------------------------------------------------------- 非流式响应解析
 
     def handle_plain_response(self, response_body, *, provider, model, api_format,
@@ -1429,6 +1590,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
                 if ttft is None:
                     ttft = time.time()
+
+                # 长流式期间保活，让 app 能区分「在途、上游还在憋」和「代理没了」。
+                # 落盘在 touch() 内部按秒节流，chunk 再密也最多一秒写一次。
+                live_status.touch()
 
                 # 再解析
                 plain = decompressor.feed(chunk)
@@ -1674,6 +1839,10 @@ def main():
     for name in purge_old_stats():
         print(f"[INFO] 已清理过期统计: {name}")
 
+    threading.Thread(
+        target=_live_status_heartbeat, name="live-status-heartbeat", daemon=True
+    ).start()
+
     httpd = ThreadedHTTPServer((LISTEN_HOST, LISTEN_PORT), ProxyHandler)
 
     print(f"[INFO] HTTP 反向代理已启动: http://{LISTEN_HOST}:{LISTEN_PORT}")
@@ -1698,6 +1867,9 @@ def main():
     except KeyboardInterrupt:
         print("\n[INFO] 正在关闭...")
         httpd.shutdown()
+        # 关停时落一次最终状态：已空闲则归零（机器人立刻睡），还有请求在途
+        # 也如实写上，app 那边靠 staleness 兜底，不会长忙不睡。
+        live_status.write()
 
 
 if __name__ == "__main__":

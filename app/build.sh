@@ -115,5 +115,5 @@ if [[ "${1:-}" == "run" ]]; then
     pkill -x "${APP_NAME}" 2>/dev/null || true
     sleep 0.5
     open "$APP"
-    echo "    已启动，图标在菜单栏右上角（⚡）"
+    echo "    已启动，图标在菜单栏右上角（Clawd 小螃蟹，请求在途时会爬）"
 fi

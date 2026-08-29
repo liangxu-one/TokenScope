@@ -45,6 +45,21 @@ func timeString(_ date: Date) -> String {
     return f.string(from: date)
 }
 
+/// 菜单栏机器人的回合计时：`42s` / `1m 32s` / `1h 03m`。
+///
+/// 与 `formatDuration`（单条请求的耗时）语义不同：这里展示的是**回合累计**，
+/// 一轮里多个请求共用一个起点，见 RobotMonitor。分钟以上不显示秒 ——
+/// 菜单栏宽度金贵，秒位跳动没有信息量（claude-status-bar 的 `1m 1s` 同款取舍）。
+func formatTurnElapsed(_ interval: TimeInterval) -> String {
+    let total = Int(interval)
+    let hours = total / 3600
+    let minutes = (total % 3600) / 60
+    let seconds = total % 60
+    if hours > 0 { return String(format: "%dh %02dm", hours, minutes) }
+    if minutes > 0 { return String(format: "%dm %02ds", minutes, seconds) }
+    return "\(seconds)s"
+}
+
 /// 套餐额度的重置时刻，紧凑展示：`2026-08-03 00:00` → `08-03 00:00`。
 ///
 /// 入参是 balance.py 给的 `yyyy-MM-dd HH:mm`。只切字符串、不解析成 Date ——
