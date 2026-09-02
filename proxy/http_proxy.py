@@ -1636,6 +1636,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
             # "status=200 却零输出"的信息——没有它这条会落盘成一次干净的成功。
             if stream_errors:
                 error = "上游流内错误: " + " | ".join(stream_errors)
+                # 流断了，usage 只可能是 message_start/中间事件的预估，权威终值没来，
+                # 计费侧不会认这笔账（2026-09-02 gpt-5.6-sol 实测：这里记了 166k 输入，
+                # 上游计费库零记录）。清零，让口径对齐"上游实际消耗"；失败本身照常
+                # 落盘，app 的失败计数不受影响。stream_errors 出自三家协议共用的
+                # SSE 解析器，任何供应商的流内错误都走同一条规则。
+                tokens = self.empty_tokens()
 
         except (BrokenPipeError, ConnectionResetError):
             error = "客户端提前断开"
