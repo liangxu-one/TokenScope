@@ -1636,12 +1636,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
             # "status=200 却零输出"的信息——没有它这条会落盘成一次干净的成功。
             if stream_errors:
                 error = "上游流内错误: " + " | ".join(stream_errors)
-                # 流断了，usage 只可能是 message_start/中间事件的预估，权威终值没来，
-                # 计费侧不会认这笔账（2026-09-02 gpt-5.6-sol 实测：这里记了 166k 输入，
-                # 上游计费库零记录）。清零，让口径对齐"上游实际消耗"；失败本身照常
-                # 落盘，app 的失败计数不受影响。stream_errors 出自三家协议共用的
-                # SSE 解析器，任何供应商的流内错误都走同一条规则。
-                tokens = self.empty_tokens()
+                # stream_errors 出自三家协议共用的 SSE 解析器，
+                # 任何供应商的流内错误都走同一条规则。
 
         except (BrokenPipeError, ConnectionResetError):
             error = "客户端提前断开"
@@ -1650,6 +1646,19 @@ class ProxyHandler(BaseHTTPRequestHandler):
         except Exception as e:
             error = f"处理流式响应失败: {e}"
             self.log_message(error)
+
+        # 流没正常走完（客户端断开 / 流内错误 / 中途异常）时，usage 只是
+        # message_start/中间事件的预估，权威终值没来，计费侧不会认账
+        # （2026-09-02 流内错误实测：记了 166k 输入、上游计费库零记录；
+        # 2026-09-07 核对 4 条断开记录在 CPA usage_log 同样全部零记录，
+        # 前后几秒的正常请求都在）。断开瞬间的预估还会把缓存读整段记成
+        # 新增输入（cached=0），一条就是十几万，对统计是纯污染。客户端断开
+        # 路径曾按"上游多半照常跑完并计费"保留过 tokens，已被实测推翻。
+        # 统一清零，口径对齐"上游实际消耗"；失败本身照常落盘，app 的失败
+        # 计数不受影响。极小窗口的代价：终值刚到齐客户端就断的那条会少算，
+        # 与 record() 的"宁可少算理论情况"同一取舍。
+        if error:
+            tokens = self.empty_tokens()
 
         if capture:
             stream_text = b"".join(raw_sse).decode("utf-8", errors="replace")
