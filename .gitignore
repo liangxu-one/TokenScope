@@ -58,3 +58,6 @@ proxy/ai_stats_domains.json
 # ── 聚合路由的 API key（明文密钥，绝不入库）
 # 参考 proxy/ai_keys.example.json
 proxy/ai_keys.json
+
+# ── zcode_reader 的水位状态（本机运行时状态；丢了也能靠 req_id 查重防重导）
+proxy/.zcode_sync_state*.json

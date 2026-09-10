@@ -1152,10 +1152,18 @@ class ProxyHandler(BaseHTTPRequestHandler):
         # 只跳过落盘，控制台那行照打（下面会标注"未计入统计"）：/api/hello 返回 401
         # 恰恰说明 key 有问题，这个信号不能丢，只是它不该进 token 统计。
         is_unknown = model == UNKNOWN_MODEL
-        if not is_unknown:
+        # from_zcode：只跳过落盘，控制台那行照打——账在 zcode_reader（旁路），
+        # 网关再记就是双计（2026-08-27 实锤）；2026-09-10 改成按构造互斥。
+        from_zcode = getattr(self, "from_zcode", False)
+        if not is_unknown and not from_zcode:
             self.save_stats(stat)
 
-        suffix = "（未计入统计）" if is_unknown else ""
+        if is_unknown:
+            suffix = "（未计入统计）"
+        elif from_zcode:
+            suffix = "（ZCode 流量，由 zcode_reader 记账）"
+        else:
+            suffix = ""
         if error:
             self.log_message(f"✗ {provider}/{model} | {status_code} | {error}{suffix}")
         else:
@@ -1293,6 +1301,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def do_request(self, method):
         started_at = time.time()
         api_format = self.detect_api_format(self.path)
+
+        # ZCode 发起的请求带 x-session-id（值随会话变，这里只看有无）。
+        # record() 据此跳过 ai_stats 落盘：ZCode 的账由 zcode_reader.py 从
+        # ZCode 用量库（db.sqlite，权威账本）旁路记，两条路径互斥才不双计。
+        self.from_zcode = bool(self.headers.get("x-session-id"))
 
         # 读取请求体
         try:
