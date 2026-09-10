@@ -116,6 +116,9 @@ DEFAULT_ANTHROPIC_VERSION = "2023-06-01"
 # 统计文件保留天数（含今天）。设为 0 则永不清理。
 RETENTION_DAYS = int(os.environ.get("AI_PROXY_RETENTION_DAYS", "3"))
 
+# ZCode 用量旁路的拉取间隔（秒）。0 = 关闭。见 _zcode_sync_loop。
+ZCODE_SYNC_INTERVAL = int(os.environ.get("ZCODE_SYNC_INTERVAL", "300"))
+
 # 日志文件与轮转配置。
 # 由程序自己持有句柄并轮转，不要用 shell 的 >> 重定向——那样外部截断文件
 # 会导致写入偏移错乱（文件看似很大但前面全是空洞）。
@@ -704,6 +707,37 @@ def _live_status_heartbeat():
     while True:
         time.sleep(LIVE_STATUS_HEARTBEAT_SECONDS)
         live_status.touch()
+
+
+def _zcode_sync_loop():
+    """
+    ZCode 用量旁路：定期把 ZCode 自己的账本（~/.zcode/cli/db/db.sqlite 的
+    model_usage）里的新调用拉进 ai_stats，与请求路径完全解耦——baseURL 指哪、
+    走不走代理都不影响记账。
+
+    为什么内嵌线程不会双计：record() 对带 x-session-id 的请求不落盘，
+    ZCode 的账由本线程独家记，两个来源按构造互斥（2026-08-27 那版双计的教训）。
+
+    - 没有账本的机器（不用 ZCode 的用户）直接不启用，零开销零残留；
+    - ZCODE_SYNC_INTERVAL=0 关闭；拉取失败只告警，等下一轮（水位幂等）；
+    - 落盘与 save_stats 共用 stats_lock，同进程内 append 不会互相穿插；
+    - 拉取频率 = 项目在跑就统计，代理停了账也不丢（水位不前进，起来补拉）。
+    """
+    import zcode_reader   # 同目录模块；账本/水位路径都在它的模块常量里
+
+    if ZCODE_SYNC_INTERVAL <= 0:
+        return
+    if not os.path.exists(zcode_reader.LOCAL_DB):
+        print("[INFO] 未检测到 ZCode 用量库（db.sqlite），ZCode 旁路统计不启用")
+        return
+    print(f"[INFO] ZCode 用量旁路已启用：每 {ZCODE_SYNC_INTERVAL}s 拉一次")
+    while True:
+        try:
+            with ProxyHandler.stats_lock:
+                zcode_reader.sync(zcode_reader.LOCAL_DB, zcode_reader.STATE_FILE)
+        except Exception as e:
+            print(f"[WARN] zcode_reader 拉取失败（下轮重试）：{e}")
+        time.sleep(ZCODE_SYNC_INTERVAL)
 
 
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
@@ -1869,6 +1903,10 @@ def main():
 
     threading.Thread(
         target=_live_status_heartbeat, name="live-status-heartbeat", daemon=True
+    ).start()
+
+    threading.Thread(
+        target=_zcode_sync_loop, name="zcode-sync", daemon=True
     ).start()
 
     httpd = ThreadedHTTPServer((LISTEN_HOST, LISTEN_PORT), ProxyHandler)

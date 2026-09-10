@@ -43,11 +43,6 @@ stop_proxy
 # -u 关闭输出缓冲，否则日志会积压在缓冲区里看不到
 CMD=(python3 -u http_proxy.py)
 
-# ZCode 用量旁路的 launchd 定时任务（每 5 分钟拉一次 token 统计）：
-# 幂等安装——机器上有 ~/.zcode/cli/db/db.sqlite 才装，不用 ZCode 的机器
-# 自动跳过、什么都不留。已装过的不动它。详见 zcode_reader_agent.sh。
-bash zcode_reader_agent.sh ensure || true
-
 # 注意：日志文件由 Python 自己写入并轮转（RotatingFileHandler），
 # 这里不要再用 >> 重定向到同一个文件，否则两个写入方会互相干扰。
 # 后台运行时把终端输出丢弃即可。

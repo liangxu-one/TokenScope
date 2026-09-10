@@ -24,7 +24,6 @@ proxy/                    Python 反向代理
   balance.py              查询各渠道剩余额度
   selftest_usage.py       归一化 / 路由 / 额度解析回归自测
   zcode_reader.py         ZCode 用量旁路：从 ZCode 的 db.sqlite 拉取调用明细
-  zcode_reader_agent.sh   上面那个的 launchd 定时任务安装/卸载/状态
   selftest_zcode_reader.py  zcode_reader 的回归自测
 app/                      SwiftUI 菜单栏应用
   Sources/TokenScope/     源码
@@ -294,28 +293,26 @@ ZCode 客户端（内置渠道）的模型调用**不经过本代理**，但它�
 从这份账本旁路读取，落进与代理相同的 ai_stats 文件，菜单栏里就能和代理流量一起看。
 
 **与代理如何避免重复记账（双计）**：ZCode 发出的请求自带 `x-session-id` 头，
-代理对这类请求只透传、不落盘；它们的账由 reader 从账本独家负责。两个来源按
-构造互斥，同一轮调用不可能记两条。
+代理对这类请求只透传、不落盘；它们的账由 reader 独家负责。两个来源按构造
+互斥，同一轮调用不可能记两条。
 
-**自动安装**：`./start.sh -d` 启动代理时自动安装 launchd 定时任务（每 5 分钟
-拉一次）。前提守卫：机器上存在 `~/.zcode/cli/db/db.sqlite` 才装——**不用
-ZCode 的机器启动代理时自动跳过，不留任何东西**，其余功能完全不受影响。
+**自动拉取**：内嵌在代理进程里——`http_proxy.py` 启动时开一个后台线程，每
+5 分钟（`ZCODE_SYNC_INTERVAL` 秒，设 0 关闭）拉一次账本。不装任何系统服务，
+代理在跑就自动统计；机器上没有 `~/.zcode/cli/db/db.sqlite`（不用 ZCode）则
+线程自行退出，零开销。代理停了账也不丢：水位不前进，下次启动自动补拉。
 
 手动管理：
 
 ```bash
 cd proxy
-bash zcode_reader_agent.sh status     # 装没装、上次运行结果
-bash zcode_reader_agent.sh remove     # 停掉并删除定时任务
 python3 zcode_reader.py               # 手动立刻拉一轮（幂等，随便跑）
 python3 zcode_reader.py --check       # 按天对账：db 行数 vs ai_stats 行数
 python3 zcode_reader.py --remote 2222 # 拉远程开发机的账（走 ssh 隧道，五台一库）
 ```
 
 细节：首跑只立水位不补历史（历史属于当时记它的那一方，补了就是双计）；补某天的账
-用 `--backfill-day`，它拒绝目标天里已有代理记录的日子。运行日志在
-`~/Library/Logs/zcode-reader.log`，水位状态在 `proxy/.zcode_sync_state.json`
-（均在 gitignore）。
+用 `--backfill-day`，它拒绝目标天里已有代理记录的日子。水位状态在
+`proxy/.zcode_sync_state.json`（gitignore）。
 
 ## 环境变量
 
