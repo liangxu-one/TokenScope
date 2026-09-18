@@ -31,6 +31,8 @@
 幂等：状态文件记 rowid 水位；行级再按 ``req_id``（= ``zcode-<model_usage.id>``）
 在目标天文件里查重——状态文件丢了也不会重复记账。req_id 是 ai_stats 行里的
 多余键，Swift 端 JSONDecoder 对未知键忽略，AiStat 解码不受影响。
+另有网关直记守卫（2026-09-18）：req_id 形如 ``gw-<session_id>`` 的行是网关
+替"会话不在本地库"的流量（远程/脚本）记的账，本读取器对这类会话整段跳过。
 
 首跑（无状态文件）**只立水位、不追历史**：历史已由网关记过（09-07~09-09 的
 glm/gpt 行），追了就是双计。想重导某段历史是高级操作，手工删水位前先想清楚。
@@ -145,6 +147,21 @@ def day_file_has(path: str, req_id: str) -> bool:
         return any(req_id in line for line in f)
 
 
+def day_file_has_gateway(path: str, session_id: str) -> bool:
+    """天文件里是否已有该会话的网关直记行（req_id = gw-<session_id>）。
+
+    网关直记（2026-09-18 起）的是"会话不在本地库"的流量——远程 ZCode 经
+    隧道、脚本伪造头，这些行的账本地库永远不会有。守卫防的是反方向：
+    这类会话的行日后经库镜像进本地库、或手动 --remote 并账时，reader
+    再导一遍就是双计。marker 按带引号的值匹配，不依赖键名空格风格。
+    """
+    if not session_id or not os.path.exists(path):
+        return False
+    marker = f'"gw-{session_id}"'
+    with open(path, encoding="utf-8") as f:
+        return any(marker in line for line in f)
+
+
 def open_db(db_path: str) -> sqlite3.Connection:
     """只读打开。WAL 库的只读连接偶发打不开时，退回拷贝三件套再读。"""
     uri = f"file:{db_path}?mode=ro"
@@ -236,6 +253,11 @@ def sync(db_path: str, state_path: str) -> int:
         path = stats_file_for(row["started_at"])
         if day_file_has(path, stat["req_id"]):
             continue                  # 状态文件丢过一次的补账场景，防重
+        # 网关直记守卫：gw- 行说明该会话已由网关记账（2026-09-18）。
+        # 跳过但水位照常放行——这是分流，不是故障，堵水位反而会卡死后续导入。
+        if day_file_has_gateway(path, row["session_id"]):
+            dropped += 1
+            continue
         by_file.setdefault(path, []).append(stat)
 
     for path, stats in by_file.items():
@@ -299,6 +321,9 @@ def backfill_day(day: str) -> int:
             if day_file_has(path, stat["req_id"]):
                 skipped += 1
                 continue
+            if day_file_has_gateway(path, row["session_id"]):
+                skipped += 1      # 该会话已由网关直记，再导就是双计
+                continue
             f.write(json.dumps(stat, ensure_ascii=False) + "\n")
             imported += 1
     print(f"[BACKFILL] {day}: 新增 {imported} / 已存在跳过 {skipped}"
@@ -308,8 +333,9 @@ def backfill_day(day: str) -> int:
 
 def check() -> int:
     """对账：db 里近 N 天 completed 行 vs ai_stats 里 req_id 行（reader 记的）。
-    差额 = 网关记的那部分（x-session-id 拦截上线前经 12345 的流量）或直连流量
-    在 reader 水位未覆盖的时段，人工判读，不自动下结论。"""
+    三桶：reader（zcode- 前缀，来自本地库）、网关直记（gw- 前缀，会话不在
+    本地库的远程/脚本流量，本地库天然没有）、gateway（无 req_id，普通客户端）。
+    差额人工判读，不自动下结论；有远程流量时 ai_stats > db 属预期。"""
     now = dt.datetime.now()
     days = [ (now - dt.timedelta(days=i)).strftime("%Y-%m-%d")
              for i in range(RETENTION_DAYS) ]
@@ -321,7 +347,7 @@ def check() -> int:
                 "AND strftime('%Y-%m-%d', started_at/1000, 'unixepoch', "
                 "'localtime') = ?", (day,)).fetchone()[0]
             path = os.path.join(STATS_DIR, f"{STATS_PREFIX}{day}{STATS_SUFFIX}")
-            zcode = gateway = 0
+            zcode = gateway = direct = 0
             if os.path.exists(path):
                 for line in open(path, encoding="utf-8"):
                     try:
@@ -329,12 +355,15 @@ def check() -> int:
                     except json.JSONDecodeError:
                         continue
                     if "req_id" in rec:
-                        zcode += 1
+                        if str(rec["req_id"]).startswith("gw-"):
+                            direct += 1
+                        else:
+                            zcode += 1
                     else:
                         gateway += 1
-            flag = "" if rows == zcode + gateway else "  ⚠️ 对不上"
-            print(f"{day}  db={rows}  ai_stats={zcode + gateway}"
-                  f"  (reader {zcode} + gateway {gateway}){flag}")
+            flag = "" if rows == zcode + gateway + direct else "  ⚠️ 对不上"
+            print(f"{day}  db={rows}  ai_stats={zcode + gateway + direct}"
+                  f"  (reader {zcode} + gateway {gateway} + 网关直记 {direct}){flag}")
     finally:
         conn.close()
     return 0

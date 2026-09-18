@@ -715,8 +715,10 @@ def _zcode_sync_loop():
     model_usage）里的新调用拉进 ai_stats，与请求路径完全解耦——baseURL 指哪、
     走不走代理都不影响记账。
 
-    为什么内嵌线程不会双计：record() 对带 x-session-id 的请求不落盘，
-    ZCode 的账由本线程独家记，两个来源按构造互斥（2026-08-27 那版双计的教训）。
+    为什么内嵌线程不会双计：record() 对**本地** ZCode 会话（session 表可查到）
+    的 x-session-id 请求不落盘，账由本线程独家记，两个来源按构造互斥
+    （2026-08-27 那版双计的教训）；非本地会话（远程/脚本）reader 看不见，
+    由网关直记，见 session_in_local_db（2026-09-18 补的盲区）。
 
     - 没有账本的机器（不用 ZCode 的用户）直接不启用，零开销零残留；
     - ZCODE_SYNC_INTERVAL=0 关闭；拉取失败只告警，等下一轮（水位幂等）；
@@ -746,6 +748,51 @@ def _zcode_sync_loop():
         except Exception as e:
             print(f"[WARN] zcode_reader 拉取失败（下轮重试）：{e}")
         time.sleep(ZCODE_SYNC_INTERVAL)
+
+
+# x-session-id（header 原值）→ 本地库 session 表的规范 id。正向缓存：
+# 查到过的会话不再打库；查不到的也缓存（session 行先于首调落库，实测 15/15，
+# 不会出现"先查无后查有"的本地会话）。
+_local_session_cache = {}
+_local_session_lock = threading.Lock()
+
+
+def session_in_local_db(session_id):
+    """x-session-id 的会话是否属于本机桌面 ZCode（本地用量库 session 表可查到）。
+
+    命中返回库里的规范 id（sess_ 前缀形状）；查不到/库不可用返回 None，
+    调用方把 None 视为"网关直记"。失败方向选直记是刻意的：reader 与本查询
+    读同一个库，库打不开时它同样记不了账，直记不会双计（2026-09-18 定）。
+
+    背景：reader 只读本地库，远程会话（隧道进来的 x-session-id）的账落在
+    远端库，网关若照旧让账就是两边都不记（0918 实锤 10:54-11:01 整段丢失）。
+    header 值带不带 sess_ 前缀两种形状都查，返回规范形状给 gw- 标记做 join 键。
+    """
+    if not session_id:
+        return None
+    with _local_session_lock:
+        if session_id in _local_session_cache:
+            return _local_session_cache[session_id]
+    canonical = None
+    try:
+        import sqlite3
+        import zcode_reader   # 同目录模块；LOCAL_DB 路径在它的常量里
+        db_path = zcode_reader.LOCAL_DB
+        if os.path.exists(db_path):
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5)
+            try:
+                for cand in (session_id, f"sess_{session_id}"):
+                    if conn.execute("SELECT 1 FROM session WHERE id = ?",
+                                    (cand,)).fetchone():
+                        canonical = cand
+                        break
+            finally:
+                conn.close()
+    except Exception:
+        return None
+    with _local_session_lock:
+        _local_session_cache[session_id] = canonical
+    return canonical
 
 
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
@@ -1194,16 +1241,31 @@ class ProxyHandler(BaseHTTPRequestHandler):
         # 只跳过落盘，控制台那行照打（下面会标注"未计入统计"）：/api/hello 返回 401
         # 恰恰说明 key 有问题，这个信号不能丢，只是它不该进 token 统计。
         is_unknown = model == UNKNOWN_MODEL
-        # from_zcode：只跳过落盘，控制台那行照打——账在 zcode_reader（旁路），
-        # 网关再记就是双计（2026-08-27 实锤）；2026-09-10 改成按构造互斥。
+        # from_zcode 的账分两路（2026-09-18 补盲区）：
+        # - 会话在本地用量库（本机桌面会话）→ 只跳过落盘，控制台那行照打——
+        #   账在 zcode_reader（旁路），网关再记就是双计（2026-08-27 实锤，
+        #   2026-09-10 改按构造互斥）；
+        # - 会话不在本地库（远程 ZCode 经隧道、脚本伪造头）→ reader 永远
+        #   看不见这份账，网关直记，req_id 打 gw-<session_id> 前缀供
+        #   zcode_reader 的防双计守卫识别。
         from_zcode = getattr(self, "from_zcode", False)
-        if not is_unknown and not from_zcode:
-            self.save_stats(stat)
+        zcode_sid = getattr(self, "zcode_session_id", None)
+        gateway_recorded = False
+        if not is_unknown:
+            if from_zcode and session_in_local_db(zcode_sid) is None:
+                stat["req_id"] = f"gw-{zcode_sid}"
+                self.save_stats(stat)
+                gateway_recorded = True
+            elif not from_zcode:
+                self.save_stats(stat)
 
         if is_unknown:
             suffix = "（未计入统计）"
+        elif gateway_recorded:
+            suffix = "（网关直记：会话不在本地库）"
         elif from_zcode:
-            suffix = "（ZCode 流量，由 zcode_reader 记账）"
+            sid_tag = zcode_sid[:8] if zcode_sid else "?"
+            suffix = f"（ZCode 流量，由 zcode_reader 记账 sid={sid_tag}）"
         else:
             suffix = ""
         if error:
@@ -1344,10 +1406,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
         started_at = time.time()
         api_format = self.detect_api_format(self.path)
 
-        # ZCode 发起的请求带 x-session-id（值随会话变，这里只看有无）。
-        # record() 据此跳过 ai_stats 落盘：ZCode 的账由 zcode_reader.py 从
-        # ZCode 用量库（db.sqlite，权威账本）旁路记，两条路径互斥才不双计。
-        self.from_zcode = bool(self.headers.get("x-session-id"))
+        # ZCode 发起的请求带 x-session-id（值随会话变）。record() 据此分流：
+        # 会话在本地用量库 → 跳过落盘，账由 zcode_reader.py 从 db.sqlite
+        # （权威账本）旁路记；会话不在（远程/脚本）→ 网关直记。互斥才不双计。
+        self.zcode_session_id = self.headers.get("x-session-id") or None
+        self.from_zcode = bool(self.zcode_session_id)
 
         # 读取请求体
         try:

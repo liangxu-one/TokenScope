@@ -901,6 +901,63 @@ def test_live_status():
         check("在途数落进文件", payload["in_flight"], 1)
 
 
+# ---------------------------------------------------- ZCode 记账分流
+
+def test_zcode_accounting_split():
+    print("\n[15] ZCode 记账分流（本地让位 reader / 非本地网关直记）")
+    import http_proxy
+
+    saved = []
+    logs = []
+
+    class _Rec(_Fake):
+        def __init__(self, sid):
+            self.from_zcode = bool(sid)
+            self.zcode_session_id = sid
+
+        def save_stats(self, stat):
+            saved.append(stat)
+
+        def log_message(self, fmt, *args):
+            logs.append(fmt % args if args else fmt)
+
+    def record_once(handler):
+        saved.clear()
+        logs.clear()
+        handler.record(provider="glm", model="glm-5.3-flash",
+                       api_format="anthropic", path="/glm/api/anthropic/v1/messages",
+                       tokens=tokens(10, 20, 0, 5), status_code=200,
+                       started_at=time.time(), ttft=time.time(), is_stream=True)
+        return saved, logs
+
+    original = http_proxy.session_in_local_db
+    try:
+        # 本地会话（session 表可查到）：照旧跳过落盘，账在 zcode_reader——
+        # 网关再记就是双计（2026-08-27 实锤，09-10 按构造互斥）
+        http_proxy.session_in_local_db = lambda sid: sid
+        record_once(_Rec("sess_local1234"))
+        check("本地会话不落盘（reader 独家记账）", saved, [])
+        check("本地会话日志带 sid 前 8 位（观测用）",
+              any("sess_loc" in line for line in logs), True)
+
+        # 非本地会话（远程 ZCode 经隧道、脚本伪造头）：reader 看不见这份账，
+        # 网关直记，req_id 打 gw-<session_id> 供 zcode_reader 守卫识别（0918 补盲区）
+        http_proxy.session_in_local_db = lambda sid: None
+        saved1, logs1 = record_once(_Rec("sess_remote999"))
+        check("非本地会话网关直记 1 条", len(saved1), 1)
+        check("直记行带 gw-<session_id> 标记",
+              saved1[0].get("req_id"), "gw-sess_remote999")
+        check("直记行日志标注网关直记",
+              any("网关直记" in line for line in logs1), True)
+
+        # 普通客户端（无 x-session-id）：原路径一行不变
+        saved2, _ = record_once(_Rec(None))
+        check("无 x-session-id 照常落盘", len(saved2), 1)
+        check("普通行不带 req_id", "req_id" in saved2[0], False)
+    finally:
+        http_proxy.session_in_local_db = original
+
+
 def main():
     print("=" * 68)
     print("TokenScope 归一化 / 路由自测")
@@ -921,6 +978,7 @@ def main():
     test_balance_parsing()
     test_glm_parsing()
     test_live_status()
+    test_zcode_accounting_split()
 
     print("\n" + "=" * 68)
     if FAILURES:

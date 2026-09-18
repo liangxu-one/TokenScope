@@ -53,6 +53,7 @@ def make_row(**kw):
         id="usage_x_1", model_id="glm-5.3-flash", status="completed",
         started_at=1789000000000, duration_ms=12345,
         time_to_first_token_ms=678,
+        session_id="sess_selftest",
         input_tokens=1000, output_tokens=50, reasoning_tokens=0,
         cache_read_input_tokens=800, cache_creation_input_tokens=0,
     )
@@ -61,7 +62,8 @@ def make_row(**kw):
     conn.row_factory = sqlite3.Row
     conn.execute("CREATE TABLE t ("
                  + ",".join(f"{k} INTEGER" if k != "id" and k != "model_id"
-                            and k != "status" else f"{k} TEXT"
+                            and k != "status" and k != "session_id"
+                            else f"{k} TEXT"
                             for k in cols) + ")")
     conn.execute(f"INSERT INTO t VALUES ({','.join('?' * len(cols))})",
                  tuple(cols.values()))
@@ -126,15 +128,16 @@ def test_state_watermark_with_pending():
             conn.execute("CREATE TABLE model_usage (id TEXT PRIMARY KEY,"
                          " status TEXT, started_at INTEGER, duration_ms INTEGER,"
                          " time_to_first_token_ms INTEGER, model_id TEXT,"
+                         " session_id TEXT,"
                          " input_tokens INTEGER, output_tokens INTEGER,"
                          " reasoning_tokens INTEGER,"
                          " cache_read_input_tokens INTEGER,"
                          " cache_creation_input_tokens INTEGER)")
             now = int(__import__("time").time() * 1000)
             conn.execute("INSERT INTO model_usage VALUES ('u100','running',?,0,0,"
-                         "'glm-5.3-flash',0,0,0,0,0)", (now,))
+                         "'glm-5.3-flash','sess_t',0,0,0,0,0)", (now,))
             conn.execute("INSERT INTO model_usage VALUES ('u101','completed',?,5,1,"
-                         "'glm-5.3-flash',10,2,0,0,0)", (now,))
+                         "'glm-5.3-flash','sess_t',10,2,0,0,0)", (now,))
             conn.commit()
             conn.close()
             state_path = os.path.join(d, "state.json")
@@ -223,6 +226,47 @@ def test_error_cancelled_dropped():
             zr.STATS_DIR = zr.SCRIPT_DIR
 
 
+def test_gateway_direct_guard():
+    # 依据 2026-09-18：req_id = gw-<sid> 的行是网关替"会话不在本地库"的流量
+    # （远程 ZCode 经隧道、脚本伪造头）直记的账，本地/远端库再导同会话的行
+    # 就是双计。守卫只跳该会话的行，其余照导；水位照常放行（分流不是故障）。
+    with tempfile.TemporaryDirectory() as d:
+        zr.STATS_DIR = d
+        try:
+            db = os.path.join(d, "db.sqlite")
+            conn = sqlite3.connect(db)
+            conn.execute("CREATE TABLE model_usage (id TEXT PRIMARY KEY,"
+                         " status TEXT, started_at INTEGER, duration_ms INTEGER,"
+                         " time_to_first_token_ms INTEGER, model_id TEXT,"
+                         " session_id TEXT,"
+                         " input_tokens INTEGER, output_tokens INTEGER,"
+                         " reasoning_tokens INTEGER,"
+                         " cache_read_input_tokens INTEGER,"
+                         " cache_creation_input_tokens INTEGER)")
+            now = int(__import__("time").time() * 1000)
+            conn.execute("INSERT INTO model_usage VALUES ('u200','completed',?,5,1,"
+                         "'glm-5.3-flash','sess_remote',10,2,0,0,0)", (now,))
+            conn.execute("INSERT INTO model_usage VALUES ('u201','completed',?,5,1,"
+                         "'glm-5.3-flash','sess_local',10,2,0,0,0)", (now,))
+            conn.commit()
+            conn.close()
+            out = os.path.join(d, zr.STATS_PREFIX
+                               + zr.fmt_ts(now)[:10] + ".jsonl")
+            with open(out, "w") as f:
+                f.write(json.dumps({"req_id": "gw-sess_remote"}) + "\n")
+            state_path = os.path.join(d, "state.json")
+            with open(state_path, "w") as f:
+                json.dump({"max_rowid": 0}, f)
+            zr.sync(db, state_path)
+            body = open(out).read()
+            assert "zcode-u200" not in body, "gw- 已记账的会话不得再导（双计）"
+            assert "zcode-u201" in body, "没有 gw- 行的会话照常导入"
+            assert json.load(open(state_path))["max_rowid"] == 2, \
+                f"守卫跳过的行也要放行水位: {json.load(open(state_path))}"
+        finally:
+            zr.STATS_DIR = zr.SCRIPT_DIR
+
+
 def main():
     print("zcode_reader selftest:")
     check("new_input 减缓存、穿底兜 0", test_new_input)
@@ -234,6 +278,7 @@ def main():
     check("水位不在途行上顶穿 + 幂等重放", test_state_watermark_with_pending)
     check("首跑只立水位", test_first_run_sets_watermark_only)
     check("error/cancelled 丢弃", test_error_cancelled_dropped)
+    check("网关直记守卫（gw- 会话整段跳过）", test_gateway_direct_guard)
     if FAILURES:
         print(f"\n❌ {len(FAILURES)} 项失败: {FAILURES}")
         return 1
