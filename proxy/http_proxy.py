@@ -735,6 +735,14 @@ def _zcode_sync_loop():
         try:
             with ProxyHandler.stats_lock:
                 zcode_reader.sync(zcode_reader.LOCAL_DB, zcode_reader.STATE_FILE)
+                # reader 落盘不走 save_stats 的跨天检查；若某天只有 ZCode 流量，
+                # 网关侧一行统计都不写，purge 就永远不触发（旧文件逐日悬留）。
+                # 在这里补上翻转，让清理只依赖"网关在跑"，不依赖流量构成。
+                today = datetime.now().strftime("%Y-%m-%d")
+                if ProxyHandler._current_day != today:
+                    ProxyHandler._current_day = today
+                    for name in purge_old_stats():
+                        print(f"[INFO] 已清理过期统计: {name}", flush=True)
         except Exception as e:
             print(f"[WARN] zcode_reader 拉取失败（下轮重试）：{e}")
         time.sleep(ZCODE_SYNC_INTERVAL)
