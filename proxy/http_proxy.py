@@ -1152,7 +1152,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
         # 只跳过落盘，控制台那行照打（下面会标注"未计入统计"）：/api/hello 返回 401
         # 恰恰说明 key 有问题，这个信号不能丢，只是它不该进 token 统计。
         is_unknown = model == UNKNOWN_MODEL
-        if not is_unknown:
+        # error 行不落 jsonl（2026-09-21 用户拍板）：✗ 日志行照打，失败信号
+        # 在 http_proxy.log 里看；jsonl 只记成功请求的 token 统计。
+        if not is_unknown and not error:
             self.save_stats(stat)
 
         suffix = "（未计入统计）" if is_unknown else ""
