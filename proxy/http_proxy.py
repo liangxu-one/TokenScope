@@ -123,6 +123,13 @@ LOG_FILE = os.path.join(SCRIPT_DIR, "http_proxy.log")
 LOG_MAX_BYTES = int(os.environ.get("AI_PROXY_LOG_MAX_MB", "5")) * 1024 * 1024
 LOG_BACKUP_COUNT = int(os.environ.get("AI_PROXY_LOG_BACKUPS", "2"))
 
+# 失败信号单独落一份（三段式口径）：
+#   成功统计 → ai_stats-*.jsonl（error 行不落）
+#   失败请求 → http_proxy_error.log（✗ 行只进这里）
+#   运行流水 → http_proxy.log（不含 ✗ 失败行）
+# 与主日志同规格轮转；排失败问题只看这一个文件，不用在流水里翻。
+ERROR_LOG_FILE = os.path.join(SCRIPT_DIR, "http_proxy_error.log")
+
 # 抓包模式：设置环境变量 AI_PROXY_CAPTURE=1 开启，
 # 会把每个请求的完整报文（含原始 SSE 流）写入 captures/ 目录，用于分析各家字段差异。
 CAPTURE_ENABLED = os.environ.get("AI_PROXY_CAPTURE", "").lower() not in ("", "0", "false", "no")
@@ -203,6 +210,20 @@ def setup_logging():
     logger.propagate = False
     logger.handlers.clear()
     logger.addHandler(handler)
+
+    # 失败信号走独立的 logger 和文件，与主流水互不混写
+    error_handler = RotatingFileHandler(
+        ERROR_LOG_FILE,
+        maxBytes=LOG_MAX_BYTES,
+        backupCount=LOG_BACKUP_COUNT,
+        encoding="utf-8",
+    )
+    error_handler.setFormatter(logging.Formatter("%(message)s"))
+    error_logger = logging.getLogger("ai_proxy_error")
+    error_logger.setLevel(logging.INFO)
+    error_logger.propagate = False
+    error_logger.handlers.clear()
+    error_logger.addHandler(error_handler)
 
     original_print = builtins.print
     print_lock = threading.Lock()
@@ -732,6 +753,17 @@ class ProxyHandler(BaseHTTPRequestHandler):
         text = fmt % args if args else fmt
         print(f"[{timestamp}] {text}", flush=True)
 
+    def log_error_line(self, text):
+        """
+        失败信号专用：只写 http_proxy_error.log，不再进 http_proxy.log。
+
+        覆盖三类：请求失败（record() 的 ✗ 行）、聚合路由配置失败、
+        中途异常/断开的原始信号行。error 行本就不落 jsonl（5cca4f3），
+        现在也不进主流水，三处互不重复。
+        """
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        logging.getLogger("ai_proxy_error").info(f"[{timestamp}] {text}")
+
     # ------------------------------------------------------------- 路由解析
 
     def resolve_route(self, model=UNKNOWN_MODEL, api_format="openai"):
@@ -1098,7 +1130,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 with open(path, "a", encoding="utf-8") as f:
                     f.write(json.dumps(stat, ensure_ascii=False) + "\n")
         except Exception as e:
-            self.log_message(f"写入统计失败: {e}")
+            self.log_error_line(f"写入统计失败: {e}")
 
     def record(self, *, provider, model, api_format, path, tokens,
                status_code, started_at, ttft, is_stream, error=None):
@@ -1152,14 +1184,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
         # 只跳过落盘，控制台那行照打（下面会标注"未计入统计"）：/api/hello 返回 401
         # 恰恰说明 key 有问题，这个信号不能丢，只是它不该进 token 统计。
         is_unknown = model == UNKNOWN_MODEL
-        # error 行不落 jsonl（2026-09-21 用户拍板）：✗ 日志行照打，失败信号
-        # 在 http_proxy.log 里看；jsonl 只记成功请求的 token 统计。
+        # error 行不落 jsonl 也不进主流水：失败信号只在 http_proxy_error.log
+        # 的 ✗ 行里看；jsonl 只记成功请求的 token 统计。
         if not is_unknown and not error:
             self.save_stats(stat)
 
         suffix = "（未计入统计）" if is_unknown else ""
         if error:
-            self.log_message(f"✗ {provider}/{model} | {status_code} | {error}{suffix}")
+            self.log_error_line(f"✗ {provider}/{model} | {status_code} | {error}{suffix}")
         else:
             message = (
                 f"✓ {provider}/{model} | 新增输入: {tokens['new_input_tokens']} | "
@@ -1318,7 +1350,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             # 只打日志、不落盘。这是代理侧的配置错误，不是一次真实的 API 消耗，
             # 落盘就得给它编一个 provider 名，白白污染渠道维度。
             # （与 record() 里"model 未知只打日志不落盘"是同一个取舍。）
-            self.log_message(f"✗ 聚合路由失败 | 模型: {model} | {e}")
+            self.log_error_line(f"✗ 聚合路由失败 | 模型: {model} | {e}")
             try:
                 self.send_json_error(400, str(e))
             except (BrokenPipeError, ConnectionResetError):
@@ -1450,13 +1482,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
             )
 
         except (BrokenPipeError, ConnectionResetError):
-            self.log_message("客户端提前断开连接")
+            self.log_error_line("客户端提前断开连接")
             if capture:
                 capture.add("异常", "客户端提前断开连接")
                 capture.flush()
 
         except Exception as e:
-            self.log_message(f"请求失败: {e}")
+            self.log_error_line(f"请求失败: {e}")
             try:
                 message = f"Proxy Error: {e}".encode("utf-8")
                 self.relay_headers(
@@ -1643,11 +1675,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         except (BrokenPipeError, ConnectionResetError):
             error = "客户端提前断开"
-            self.log_message(error)
+            self.log_error_line(error)
 
         except Exception as e:
             error = f"处理流式响应失败: {e}"
-            self.log_message(error)
+            self.log_error_line(error)
 
         # 流没正常走完（客户端断开 / 流内错误 / 中途异常）时，usage 只是
         # message_start/中间事件的预估，权威终值没来，计费侧不会认账

@@ -606,7 +606,9 @@ Responses 的嵌套 usage 与嵌套 error、聚合路由的 URL 拼接与密钥�
 
 ## 数据文件
 
-- 按天生成 `proxy/ai_stats-YYYY-MM-DD.jsonl`，每行一条 JSON
+- 按天生成 `proxy/ai_stats-YYYY-MM-DD.jsonl`，每行一条 JSON（**只记成功请求**）
+- 失败请求的 ✗ 行单独写 `proxy/http_proxy_error.log`（轮转规格同 `http_proxy.log`），
+  不进运行流水 `http_proxy.log` 也不落 jsonl —— 排失败问题只看这一个文件
 - **写入方只有代理**，应用只读，避免两个进程互相干扰
 - 应用按文件名读取当天数据，跨天自动切换（不做时间戳过滤）
 - 过期文件由代理在启动时和跨天时自动清理

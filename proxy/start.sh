@@ -7,6 +7,9 @@
 #   ./start.sh -c           前台运行 + 开启抓包（排查 token 对不上时用）
 #   ./start.sh stop         停止代理
 #   ./start.sh log          跟踪日志
+#
+# 日志分两份：http_proxy.log 是运行流水（不含失败行）；
+# 失败请求的 ✗ 行单独写 http_proxy_error.log，排失败问题看那份。
 set -euo pipefail
 
 cd "$(dirname "$0")"
