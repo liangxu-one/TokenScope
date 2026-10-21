@@ -525,6 +525,26 @@ def extract_stream_error(event):
     return json.dumps(event, ensure_ascii=False)
 
 
+def stream_reached_end(terminal_events, tokens):
+    """
+    流是否已经走到逻辑终点 —— 只在「客户端已断开」时用来区分两种情况：
+
+        * 收完才走：终点事件（message_stop / [DONE] / response.completed /
+          finish_reason）和权威 usage 都已到齐，代理只是没能把尾包写出去；
+        * 中途跑掉：终点事件没来，usage 还停在 message_start 级的预估上。
+
+    这两者混为一谈会把「客户端收全后立刻关连接」误判成中断，整条请求 tokens
+    清零且不落 jsonl。2026-10-21 DSH 实测：一次会话 111 次调用里 43 次这样被
+    吞掉（约 40%），账本合计只有实际的三分之二。
+
+    只认终点事件不够：OpenAI 的 finish_reason 和带 usage 的收尾 chunk 是两个包，
+    所以还要求至少一项权威 usage 非 0。
+    """
+    if not terminal_events:
+        return False
+    return bool(tokens.get("output_tokens") or tokens.get("new_input_tokens"))
+
+
 class AggregateRouteError(Exception):
     """
     聚合路由配置问题（模型没匹配上、target 缺端点、缺 key）。
@@ -1600,6 +1620,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
         # 与 usage_events 不同，这个列表在非抓包模式下也要收集：
         # 它是判定这条请求成功还是失败的依据，不是排查用的额外信息。
         stream_errors = []
+        # 终点事件（message_stop / [DONE] / response.completed / finish_reason）：
+        # 客户端断开时用来判断「收完才走」还是「中途跑掉」，见 stream_reached_end()。
+        terminal_events = []
         client_gone = False
 
         # read1() 返回当前已到达的数据，不会阻塞等待凑满缓冲区；
@@ -1642,6 +1665,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         api_format,
                         usage_events=usage_events,
                         stream_errors=stream_errors,
+                        terminal_events=terminal_events,
                     )
                     if found:
                         resolved_model = found
@@ -1653,12 +1677,19 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     api_format,
                     usage_events=usage_events,
                     stream_errors=stream_errors,
+                    terminal_events=terminal_events,
                 )
                 if found:
                     resolved_model = found
 
             if client_gone:
-                error = "客户端提前断开"
+                # 收完才走：终点事件与权威 usage 都到齐了，只是尾包没写出去
+                # （客户端拿到完整回复后立刻关连接，代理的下一次写撞 BrokenPipe）。
+                # 这不是中断，按成功记账；否则整条请求会被清零且不落 jsonl。
+                if stream_reached_end(terminal_events, tokens):
+                    self.log_message("客户端在流结束后断开，按成功计入统计")
+                else:
+                    error = "客户端提前断开"
             else:
                 self.end_chunks()
 
@@ -1674,8 +1705,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 # 任何供应商的流内错误都走同一条规则。
 
         except (BrokenPipeError, ConnectionResetError):
-            error = "客户端提前断开"
-            self.log_error_line(error)
+            # 走到这里说明循环已经正常结束（转发中撞断开在循环内就被 client_gone
+            # 接住了），剩下能抛的只有收尾的 end_chunks。流本身已经走完，按成功记账。
+            if stream_reached_end(terminal_events, tokens):
+                self.log_message("客户端在流结束后断开（收尾阶段），按成功计入统计")
+            else:
+                error = "客户端提前断开"
+                self.log_error_line(error)
 
         except Exception as e:
             error = f"处理流式响应失败: {e}"
@@ -1689,8 +1725,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
         # 新增输入（cached=0），一条就是十几万，对统计是纯污染。客户端断开
         # 路径曾按"上游多半照常跑完并计费"保留过 tokens，已被实测推翻。
         # 统一清零，口径对齐"上游实际消耗"；失败本身照常落盘，app 的失败
-        # 计数不受影响。极小窗口的代价：终值刚到齐客户端就断的那条会少算，
-        # 与 record() 的"宁可少算理论情况"同一取舍。
+        # 计数不受影响。与 record() 的"宁可少算理论情况"同一取舍。
+        #
+        # 2026-10-21 收窄适用范围：上面说的是"流没走完"。DSH 这类客户端把
+        # 最后一块读到手就关连接、不等尾包（message_stop / [DONE]），代理下一次
+        # 写必撞 BrokenPipe，但内容和权威 usage 都已到齐。这种情况由
+        # stream_reached_end() 放行、照常记账；只有终点事件没来（真·中途断开）
+        # 才清零。当日实测：111 次调用里 43 次属于前者，被旧规则整条吞掉。
         if error:
             tokens = self.empty_tokens()
 
@@ -1720,20 +1761,28 @@ class ProxyHandler(BaseHTTPRequestHandler):
         )
 
     def parse_sse_line(self, line, tokens, api_format, usage_events=None,
-                       stream_errors=None):
+                       stream_errors=None, terminal_events=None):
         """
         解析单行 SSE 数据，把 usage 合并进 tokens。
         返回响应中声明的 model 名（若有）。
 
         流内错误通过 stream_errors 这个可变列表带出去，而不是改返回值——
         返回值的语义是 model 名，两个调用点都按 `if found: resolved_model = found` 用它。
+        终点事件同样走 terminal_events 列表带出（[DONE] / message_stop /
+        response.completed / finish_reason），供 stream_reached_end() 判断
+        「客户端收完才走」还是「中途跑掉」。
         """
         line = line.strip()
         if not line.startswith("data:"):
             return None
 
         data = line[5:].strip()
-        if not data or data == "[DONE]":
+        if not data:
+            return None
+        if data == "[DONE]":
+            # OpenAI 兼容流的分块结束符：没有 JSON 可解析，但它本身就是终点标记
+            if terminal_events is not None:
+                terminal_events.append("[DONE]")
             return None
 
         try:
@@ -1751,6 +1800,32 @@ class ProxyHandler(BaseHTTPRequestHandler):
         stream_error = extract_stream_error(event)
         if stream_error and stream_errors is not None and stream_error not in stream_errors:
             stream_errors.append(stream_error)
+
+        # 终点事件：与 usage 无关，单独收集。各家形态不同——
+        #   Anthropic   message_delta.delta.stop_reason / message_stop
+        #   OpenAI chat choices[].finish_reason（带 usage 的收尾 chunk 在它之后）
+        #   Responses   response.completed / response.incomplete
+        if terminal_events is not None:
+            if event_type == "message_stop":
+                terminal_events.append("message_stop")
+            elif event_type == "message_delta":
+                delta = event.get("delta")
+                if isinstance(delta, dict) and delta.get("stop_reason"):
+                    # 终态与权威 usage 本就在同一条事件里；缺 usage 说明形态不认识，
+                    # 不拿 message_start 的预估入账（宁可少算，见 stream_reached_end）。
+                    if event.get("usage"):
+                        terminal_events.append(f"stop_reason:{delta['stop_reason']}")
+            elif event_type in ("response.completed", "response.incomplete"):
+                terminal_events.append(event_type)
+            elif not event_type:
+                choices = event.get("choices")
+                if isinstance(choices, list):
+                    for choice in choices:
+                        if isinstance(choice, dict) and choice.get("finish_reason"):
+                            terminal_events.append(
+                                f"finish_reason:{choice['finish_reason']}"
+                            )
+                            break
 
         # Anthropic: message_start 的 usage 只是预估，仅用于填补尚为 0 的字段
         if event_type == "message_start":

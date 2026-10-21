@@ -20,7 +20,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from http_proxy import ProxyHandler, extract_stream_error  # noqa: E402
+from http_proxy import ProxyHandler, extract_stream_error, stream_reached_end  # noqa: E402
 
 FAILURES = []
 
@@ -300,6 +300,70 @@ def test_stream_parsing():
         acc, "openai",
     )
     check("OpenAI 末尾 chunk 的 usage 生效，且 usage:null 的 chunk 不误判", acc, tokens(400, 100, 0, 60))
+
+
+def test_stream_terminal_detection():
+    print("\n[6.5] 流终点识别（客户端断开时区分「收完才走」和「中途跑掉」）")
+    handler = _Fake()
+
+    # Anthropic：message_start 不是终点，message_delta 带 stop_reason 才是。
+    # 依据：官方 SSE 事件序 content_block_* → message_delta(stop_reason, usage) → message_stop。
+    term = []
+    acc = ProxyHandler.empty_tokens()
+    handler.parse_sse_line(
+        'data: {"type":"message_start","message":{"model":"m",'
+        '"usage":{"input_tokens":100}}}',
+        acc, "anthropic", terminal_events=term,
+    )
+    check("message_start 不算终点", term, [])
+    check("只有中间事件 + 预估 usage → 判定为中断", stream_reached_end(term, acc), False)
+
+    handler.parse_sse_line(
+        'data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},'
+        '"usage":{"input_tokens":6,"output_tokens":88}}',
+        acc, "anthropic", terminal_events=term,
+    )
+    check("message_delta 带 stop_reason 记为终点", term, ["stop_reason:tool_use"])
+    check("终点 + 权威 usage → 判定收完才走", stream_reached_end(term, acc), True)
+
+    # stop_reason 有、usage 缺：形态不认识，不能拿 message_start 的预估入账
+    term = []
+    handler.parse_sse_line(
+        'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}',
+        ProxyHandler.empty_tokens(), "anthropic", terminal_events=term,
+    )
+    check("message_delta 缺 usage 时不记终点（不吃预估）", term, [])
+
+    # 反面：终点到了但 usage 还没到（OpenAI 的 finish_reason 与带 usage 的收尾 chunk
+    # 是两个包），这时按清零处理，不能拿半截数字入账。
+    check("有终点但 tokens 全 0 → 不算收完",
+          stream_reached_end(["[DONE]"], ProxyHandler.empty_tokens()), False)
+
+    # [DONE]：没有 JSON 可解析，但必须被识别成终点
+    term = []
+    handler.parse_sse_line("data: [DONE]", ProxyHandler.empty_tokens(), "openai",
+                           terminal_events=term)
+    check("[DONE] 记为终点", term, ["[DONE]"])
+
+    # OpenAI chat：choices[].finish_reason
+    term = []
+    handler.parse_sse_line('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}',
+                           ProxyHandler.empty_tokens(), "openai", terminal_events=term)
+    check("finish_reason 记为终点", term, ["finish_reason:stop"])
+
+    # Responses：completed / incomplete 都是终态
+    term = []
+    handler.parse_sse_line(
+        'data: {"type":"response.completed","response":'
+        '{"usage":{"input_tokens":10,"output_tokens":2}}}',
+        ProxyHandler.empty_tokens(), "openai-responses", terminal_events=term,
+    )
+    check("response.completed 记为终点", term, ["response.completed"])
+
+    # 不传 terminal_events 的老调用点不能炸（向后兼容）
+    handler.parse_sse_line('data: {"type":"message_stop"}',
+                           ProxyHandler.empty_tokens(), "anthropic")
+    check("不传 terminal_events 时照常解析", True, True)
 
 
 def test_stream_errors():
@@ -912,6 +976,7 @@ def main():
     test_responses()
     test_api_format()
     test_stream_parsing()
+    test_stream_terminal_detection()
     test_stream_errors()
     test_model_matching()
     test_aggregate_routing()
