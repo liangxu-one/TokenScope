@@ -1,20 +1,13 @@
 import SwiftUI
 
-@main
-struct TokenScopeApp: App {
-    @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
-
-    // 这里没有 SwiftUI 场景：真正的界面是 AppDelegate 建的 NSStatusItem +
-    // NSPopover（机器人要逐帧换图和实时计时，MenuBarExtra 的 label 不适合，
-    // 取舍见 StatusItemController）。Settings 这个空场景只是给 App 协议一个
-    // body —— accessory 应用不会因为「没有可见窗口」被系统收走，进程由
-    // 状态项维持。
-    var body: some Scene {
-        Settings { EmptyView() }
-    }
-}
-
-class AppDelegate: NSObject, NSApplicationDelegate {
+// 这里是纯 AppKit 应用：入口在 main.swift（`NSApplication` + AppDelegate）。
+//
+// 早先这里是一个 `@main struct TokenScopeApp: App`，body 用
+// `Settings { EmptyView() }` 给协议占位 —— 那会在每次启动时弹出一个
+// 空白的「TokenScope Settings」窗口（本应用是 accessory，没有别的场景，
+// SwiftUI 把它当成了唯一窗口）。去掉 App 结构后，进程里只剩状态项，
+// 不会再出现任何意外的窗口。
+final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItemController: StatusItemController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
