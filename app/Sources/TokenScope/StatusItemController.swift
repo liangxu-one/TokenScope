@@ -115,8 +115,11 @@ final class StatusItemController: NSObject, NSPopoverDelegate {
         // 螃蟹是全彩非模板图，不吃 contentTintColor；显式清掉，
         // 防止从闪电切回来时残留的黄色染到什么
         button.contentTintColor = nil
+        // 朝向由 RobotMonitor 每跑满一轮翻一次：朝左就取镜像帧。
+        // 两组帧长度相同（同一份源帧），下标通用；静止态左右对称，不区分朝向。
+        let walkFrames = robot.facingLeft ? CrabIcon.busyFramesMirrored : CrabIcon.busyFrames
         button.image = robot.isBusy
-            ? CrabIcon.busyFrames[robot.frameIndex % CrabIcon.busyFrameCount]
+            ? walkFrames[robot.frameIndex % walkFrames.count]
             : CrabIcon.idle
         // 计时文本放图标右侧，空闲时整段清空。前导空格把文本和图标隔开，
         // 系统不会自动加间距

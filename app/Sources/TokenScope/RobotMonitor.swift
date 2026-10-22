@@ -50,6 +50,15 @@ final class RobotMonitor: ObservableObject {
     /// 统计面板跟着动画帧率全量重绘 —— 2026-08-29「面板卡、统计迟迟不刷新」
     /// 的根因。全应用只有菜单栏图标消费帧，走 `frames` 管道点对点送达。
     private(set) var frameIndex = 0
+    /// 当前朝向：`false` = 朝右（原帧），`true` = 朝左（镜像帧）。
+    ///
+    /// 每跑满一整轮（20 帧 = 1.6s）翻一次，菜单栏里就是左右来回走。
+    ///
+    /// ⚠️ **同样刻意不是 @Published**：掉头必然伴随一次帧事件（帧下标归零那一帧），
+    /// `StatusItemController` 刷新图标时顺手读它就够了。多挂一个发布者等于在
+    /// 12.5fps 的那条路径上再插一条 objectWillChange，面板又会被拖着重绘 ——
+    /// 与 `frameIndex` 是同一条纪律。
+    private(set) var facingLeft = false
     /// 动画帧管道。`StatusItemController` 订阅它逐帧换图标。
     private let frameSubject = PassthroughSubject<Int, Never>()
     var frames: AnyPublisher<Int, Never> { frameSubject.eraseToAnyPublisher() }
@@ -92,6 +101,7 @@ final class RobotMonitor: ObservableObject {
         stopAnimating()
         isBusy = false
         frameIndex = 0
+        facingLeft = false
         elapsedText = nil
         activeRequests = []
     }
@@ -143,6 +153,12 @@ final class RobotMonitor: ObservableObject {
         animTimer = scheduledTimer(Self.animationInterval) { [weak self] in
             guard let self else { return }
             self.frameIndex = (self.frameIndex + 1) % CrabIcon.busyFrameCount
+            // 跑满一整轮才掉头（20 帧 = 1.6s），不在半路翻 —— 画面才不会抖。
+            // 翻转只改朝向不改帧下标；本帧照常发出去，收端刷新时读 facingLeft
+            // 就会拿到新方向，不需要为掉头单独发一次事件。
+            if self.frameIndex == 0 {
+                self.facingLeft.toggle()
+            }
             // 帧不进 @Published（理由见属性注释），只点对点喂给菜单栏图标
             self.frameSubject.send(self.frameIndex)
         }
