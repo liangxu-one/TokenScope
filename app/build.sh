@@ -53,10 +53,38 @@ build_icns() {
     [[ -f "icon/AppIcon.icns" ]]
 }
 
+# ---------------------------------------------------------------- SDK
+
+# 本机只装了 CommandLineTools、没有 Xcode，默认 SDK（27.x）编不了这个 app：
+# 那套 SwiftUI 把 `@State` 改成了宏，宏插件 libSwiftUIMacros 只随 Xcode 发布，
+# CLT 里只有 libObservationMacros / libSwiftMacros。
+#
+# 机器上还留着 26.5 的 SDK —— 它的 SwiftUI 仍是属性包装器，能编过。所以有 26.5
+# 就显式用它，没有才回退默认 SDK（装了 Xcode 的机器走后者即可）。
+#
+# 链接那条不能省：`--sdk` 只管编译阶段，SwiftPM 在链接时会把「部署目标」当成
+# SDK 版本写进 LC_BUILD_VERSION（实测写成 14.0）。macOS 26+ 按这个值决定控件
+# 用哪套设计，写错会让整个面板退回旧版外观（背景、分段控件颜色全变）。
+SDK_DIR="/Library/Developer/CommandLineTools/SDKs"
+SDK_26_5="$SDK_DIR/MacOSX26.5.sdk"
+MIN_MACOS="14.0"   # 与 Package.swift 的 platforms 保持一致
+
+SDK_ARGS=()
+if [[ -d "$SDK_26_5" ]]; then
+    SDK_ARGS=(--sdk "$SDK_26_5"
+              -Xlinker -platform_version -Xlinker macos
+              -Xlinker "$MIN_MACOS" -Xlinker 26.5)
+fi
+
 # ---------------------------------------------------------------- 编译
 
 echo "==> 编译 (release)"
-swift build -c release
+# 空数组在 bash 3.2 下直接展开会踩 set -u，分成两条写
+if [[ ${#SDK_ARGS[@]} -gt 0 ]]; then
+    swift build -c release "${SDK_ARGS[@]}"
+else
+    swift build -c release
+fi
 
 echo "==> 打包 $APP"
 rm -rf "$APP"
