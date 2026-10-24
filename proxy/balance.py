@@ -34,9 +34,9 @@
 走代理只会往 jsonl 里塞无意义的记录。
 
 --------------------------------------------------------------------------------
-只内置了 DeepSeek、MiniMax 与智谱 GLM
+只内置了 DeepSeek、MiniMax、智谱 GLM 与 Kimi For Coding
 --------------------------------------------------------------------------------
-刻意只内置这三家：它们是本仓库能**实测验证过**的。各家余额接口的字段语义差异
+刻意只内置这四家：它们是本仓库能**实测验证过**的。各家余额接口的字段语义差异
 极大（见下面各实现里标注的坑），凭文档照抄而不实测，很容易写出"看起来有数字
 但其实错了"的解析 —— 那比没有这个功能更糟。
 
@@ -47,6 +47,9 @@
                                             OpenRouter / Novita AI 等
     src-tauri/src/services/coding_plan.rs   套餐额度：Kimi / ZenMux /
                                             智谱 z.ai 国际站等
+
+注意 2026-10-24 实测的 Kimi 响应已经比 cc-switch 那份 parser 新（多了 `usages`
+比率池），本文件的 parse_kimi 按实测形状写，别照抄它的 `usage` 分支。
 
 注意火山方舟不能照抄：它走控制面 OpenAPI 且强制火山签名 V4（AK/SK 一对，
 不是单个 key），凭据模型与这里不兼容。
@@ -59,7 +62,7 @@ import sys
 import unicodedata
 import urllib.error
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -212,6 +215,37 @@ def millis_to_local(ms):
         return datetime.fromtimestamp(int(ms) / 1000).strftime("%Y-%m-%d %H:%M")
     except (TypeError, ValueError, OSError, OverflowError):
         return None
+
+
+def iso_datetime(text):
+    """
+    ISO 8601 → 带时区的 datetime，非法或缺失返回 None。
+
+    上游写法不统一：Kimi 的比率池是 `2026-10-24T05:55:21Z`，旧计数窗口带
+    微秒 `...T05:55:22.273190Z`。Python 3.9 的 fromisoformat 不认末尾 Z，
+    所以先把 Z 换成 +00:00；没有时区信息的按 UTC 处理（上游语义如此），
+    这样后面比较两个窗口的"是否同一时刻"不会因为一端是 naive 就炸掉。
+    """
+    if not isinstance(text, str):
+        return None
+    value = text.strip()
+    if not value:
+        return None
+    if value.endswith(("Z", "z")):
+        value = value[:-1] + "+00:00"
+    try:
+        moment = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment
+
+
+def iso_to_local(text):
+    """ISO 8601 → 本地时间字符串（与 millis_to_local 同格式）"""
+    moment = iso_datetime(text)
+    return moment.astimezone().strftime("%Y-%m-%d %H:%M") if moment else None
 
 
 def fetch(url, api_key, *, bearer=True, headers=None):
@@ -511,6 +545,156 @@ def parse_glm(payload):
     if isinstance(level, str) and level:
         result["level"] = level
     return result
+
+
+# ============================================================ Kimi For Coding
+
+# 比率池的键名是上游枚举，不可翻译；标签按"窗口从短到长"排列。
+# `limit_month_code` 刻意不收：它是代码产品的子池，与 `limit_month_total`
+# 同时展示是同一份额度的两个切法。上游真正卡人的是月度 Total（CodexBar
+# issue #4306 的设计结论），TokenScope 也统一看这一个。
+KIMI_RATIO_POOLS = (
+    ("limit_5h", "5 小时"),
+    ("limit_7d", "7 天"),
+    ("limit_month_total", "月度"),
+)
+
+# 旧计数窗口只认实测过的 300 分钟 / 10080 分钟两种；其余时长不猜。
+KIMI_LEGACY_WINDOWS = {300: "5 小时", 10080: "7 天"}
+
+KIMI_WINDOW_UNIT_MINUTES = {
+    "TIME_UNIT_MINUTE": 1,
+    "TIME_UNIT_HOUR": 60,
+    "TIME_UNIT_DAY": 24 * 60,
+}
+
+
+@provider("kimi", "api.kimi.com", "api.kimi.ai")
+def query_kimi(api_key, base_url):
+    """
+    Kimi For Coding 订阅额度 —— 套餐额度型的第四个内置实现。
+
+    GET https://api.kimi.com/coding/v1/usages   （国际站 api.kimi.ai，路径相同）
+    Authorization: Bearer <Kimi Code 控制台签发的 key>
+
+    ⚠️ 这是**Kimi Code 订阅**，不是 Moonshot 开放平台的按量余额。后者是
+    `api.moonshot.cn/v1/users/me/balance`（货币余额），TokenScope 配置里的
+    `/kimi` 走的是前者；拿 Kimi Code 的 key 去查开放平台余额会 401。
+
+    2026-10-24 实测响应（这是本实现唯一的依据）：
+
+        {"limits": [{"window": {"duration": 300, "timeUnit": "TIME_UNIT_MINUTE"},
+                     "detail": {"limit": "100", "remaining": "100",
+                                "resetTime": "2026-10-24T05:55:22.273190Z"}}],
+         "usages": {"limit_5h": {"used_ratio": 0, "reset_time": "..."},
+                    "limit_month_total": {"used_ratio": 0, "reset_time": "..."},
+                    "limit_month_code": {"used_ratio": 0, "reset_time": "..."}}}
+
+    两个来源讲的是同一份额度，坑都在这：
+
+      1. `usages.*.used_ratio` 是 **0~1 的比率**（0.5531 = 55.31%），不是百分比；
+         直接当百分比会少两个数量级。>1 的脏值夹到 100%（同 CodexBar）。
+      2. `limits[]` 是旧计数（单位是**请求次数**），字段给 `remaining` 或
+         `used` 两种形态都实测出现过；两者都缺就跳过，别补 0。
+      3. 两个来源可能**互相矛盾**：CodexBar issue #4306 里旧计数 100/100（已用
+         100%）而比率池 0%，同一重置时刻。只有重置时刻一致（实测差 1.3s，
+         阈值取 2s）才当同一窗口、取**更耗尽**的读数；时刻对不上就不借计数，
+         保留比率池 —— 否则会把"已用 100%"显示成"0%"，让人误以为还有额度。
+      4. 月度只认 `limit_month_total`；`limit_month_code` 是子池，见上面的
+         常量注释。没有 `limit_7d` 的套餐自然只出 5 小时 + 月度两窗。
+      5. 官方 2026 年改版后**新套餐取消周额度**（只剩滚动 5 小时窗 + 月度总
+         配额），老套餐才保留周额度。所以 `limit_7d`/7 天旧计数在新账号里根本
+         不出现，是正常形态，不是解析漏了（见 docs 的 Membership Benefits）。
+    """
+    host = host_of(base_url) or "api.kimi.com"
+    if host == "api.kimi.ai" or host.endswith(".api.kimi.ai"):
+        domain = "api.kimi.ai"
+    else:
+        domain = "api.kimi.com"
+    payload, error = fetch(f"https://{domain}/coding/v1/usages", api_key)
+    return error or parse_kimi(payload)
+
+
+def kimi_legacy_label(window):
+    """旧计数窗口按 duration+timeUnit 归到哪个标签；认不出返回 None"""
+    duration = parse_number(window, "duration")
+    multiplier = KIMI_WINDOW_UNIT_MINUTES.get(str(window.get("timeUnit") or ""))
+    if duration is None or multiplier is None:
+        return None
+    return KIMI_LEGACY_WINDOWS.get(int(duration * multiplier))
+
+
+def parse_kimi(payload):
+    """与网络请求分离，便于不联网单测（见 selftest_usage.py）"""
+    payload = payload or {}
+    usages = payload.get("usages")
+    usages = usages if isinstance(usages, dict) else {}
+    limits = payload.get("limits")
+    limits = limits if isinstance(limits, list) else []
+
+    found = {}
+
+    def take(label, used_percent, raw_reset):
+        resets_at = iso_to_local(raw_reset)
+        reset_dt = iso_datetime(raw_reset)
+        previous = found.get(label)
+        if previous is None:
+            found[label] = {
+                "label": label,
+                "used_percent": used_percent,
+                "resets_at": resets_at,
+                "_reset": reset_dt,
+            }
+            return
+        # 同一窗口的两份读数：重置时刻一致才合并，取更耗尽的（理由见 query_kimi 坑 3）
+        if (previous["_reset"] is not None and reset_dt is not None
+                and abs((previous["_reset"] - reset_dt).total_seconds()) <= 2):
+            if used_percent > previous["used_percent"]:
+                previous["used_percent"] = used_percent
+                previous["resets_at"] = resets_at
+                previous["_reset"] = reset_dt
+        # 重置时刻对不上 = 不是同一个窗口，保留先到的（比率池优先于旧计数）
+
+    for key, label in KIMI_RATIO_POOLS:
+        pool = usages.get(key)
+        if not isinstance(pool, dict):
+            continue
+        ratio = parse_number(pool, "used_ratio")
+        if ratio is None or ratio < 0:
+            continue
+        take(label, min(ratio, 1.0) * 100.0, pool.get("reset_time"))
+
+    for item in limits:
+        if not isinstance(item, dict):
+            continue
+        window = item.get("window")
+        detail = item.get("detail")
+        if not isinstance(window, dict) or not isinstance(detail, dict):
+            continue
+        label = kimi_legacy_label(window)
+        if label is None:
+            continue
+        limit = parse_number(detail, "limit")
+        if limit is None or limit <= 0:
+            continue
+        used = parse_number(detail, "used")
+        if used is None:
+            remaining = parse_number(detail, "remaining")
+            if remaining is None:
+                continue  # 两个计数都没有，没法诚实算百分比
+            used = limit - remaining
+        used = max(0.0, min(used, limit))
+        raw_reset = detail.get("resetTime")
+        if raw_reset is None:
+            raw_reset = detail.get("reset_time")
+        take(label, used / limit * 100.0, raw_reset)
+
+    windows = [found[label] for label in ("5 小时", "7 天", "月度") if label in found]
+    if not windows:
+        return failure("响应里没有可展示的额度窗口（usages/limits 均为空）")
+    for window in windows:
+        window.pop("_reset", None)
+    return quota(windows)
 
 
 # ============================================================ 汇总

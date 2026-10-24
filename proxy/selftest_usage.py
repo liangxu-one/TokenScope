@@ -799,7 +799,16 @@ def test_balance_parsing():
           find_provider(["https://api.deepseek.com@evil.example/"]), None)
     check("query string 里出现域名不算命中",
           find_provider(["https://evil.example/?upstream=api.deepseek.com"]), None)
-    check("已内置三家", sorted(p["id"] for p in PROVIDERS), ["deepseek", "glm", "minimax"])
+    check("按域名找到 kimi（聚合配置里的端点形状）",
+          find_provider(["https://api.kimi.com/coding"])["id"], "kimi")
+    check("裸域名（routes 里的形状）也能认出 kimi",
+          find_provider(["api.kimi.com"])["id"], "kimi")
+    check("kimi 国际站也算同一家",
+          find_provider(["https://api.kimi.ai/coding"])["id"], "kimi")
+    # 父域不算命中：额度接口在 api.kimi.com，不能把 kimi.com 的站点流量也认进来
+    check("父域 kimi.com 不算命中", find_provider(["https://www.kimi.com"]), None)
+    check("已内置四家", sorted(p["id"] for p in PROVIDERS),
+          ["deepseek", "glm", "kimi", "minimax"])
 
 
 def test_glm_parsing():
@@ -901,10 +910,113 @@ def test_glm_parsing():
           parse_glm({"success": True, "data": {"level": "pro"}})["kind"], "error")
 
 
+def test_kimi_parsing():
+    print("\n[14] Kimi For Coding 额度解析（balance.py parse_kimi）")
+    from balance import one_line, parse_kimi
+
+    # 形状取自 2026-10-24 09:35 对用户订阅 key 的实测（见 balance.py query_kimi 文档）。
+    # 5 小时窗口同时出现在 limits（旧计数）与 usages.limit_5h（比率池）里。
+    body = {
+        "limits": [{
+            "window": {"duration": 300, "timeUnit": "TIME_UNIT_MINUTE"},
+            "detail": {"limit": "100", "remaining": "100",
+                       "resetTime": "2026-10-24T05:55:22.273190Z"},
+        }],
+        "usages": {
+            "limit_5h": {"used_ratio": 0, "reset_time": "2026-10-24T05:55:21Z"},
+            "limit_month_total": {"used_ratio": 0.5531,
+                                  "reset_time": "2026-11-24T00:00:00Z"},
+            # 子池：不该与月度 Total 同时出现（见 balance.py 常量注释）
+            "limit_month_code": {"used_ratio": 0.9,
+                                 "reset_time": "2026-11-24T00:00:00Z"},
+        },
+    }
+    result = parse_kimi(body)
+    check("kind 为 quota", result["kind"], "quota")
+    check("窗口为 5 小时 + 月度，按短到长排序",
+          [w["label"] for w in result["windows"]], ["5 小时", "月度"])
+    # used_ratio 是 0~1 的比率，不乘 100 会把 55% 显示成 1%（或 0%）
+    check("used_ratio 转百分比（0.5531 → 55.31）",
+          round(result["windows"][1]["used_percent"], 2), 55.31)
+    check("limit_month_code 子池被忽略，不顶掉月度 Total",
+          round(result["windows"][1]["used_percent"], 2), 55.31)
+    check("两个窗口都带重置时间",
+          all(w["resets_at"] is not None for w in result["windows"]), True)
+    check("不存剩余量（只留 used_percent）",
+          any("remaining" in w for w in result["windows"]), False)
+    check("单行摘要带标签与百分比",
+          one_line({"targets": {"kimi": result}}),
+          "kimi 已用 5 小时 0% 月度 55%")
+
+    # 三窗齐全（部分套餐有 limit_7d 周池）：顺序仍由固定表决定
+    three = {"usages": {"limit_5h": {"used_ratio": 0.1},
+                        "limit_7d": {"used_ratio": 0.42},
+                        "limit_month_total": {"used_ratio": 0.05}}}
+    check("三窗齐全时按短到长排列",
+          [w["label"] for w in parse_kimi(three)["windows"]],
+          ["5 小时", "7 天", "月度"])
+
+    # 旧计数形态（CodexBar issue #4306 的响应）：没有 usages，只有 limits，
+    # 且给的是 used 而不是 remaining。100/100 → 已用 100%，不能显示成 0%。
+    legacy = {"limits": [{
+        "window": {"duration": 300, "timeUnit": "TIME_UNIT_MINUTE"},
+        "detail": {"limit": "100", "used": "100",
+                   "resetTime": "2026-10-06T13:23:46.915474Z"},
+    }]}
+    r = parse_kimi(legacy)
+    check("旧计数只有 used 也能算已用", r["windows"][0]["used_percent"], 100.0)
+    check("旧计数只出 5 小时一窗", [w["label"] for w in r["windows"]], ["5 小时"])
+
+    # 矛盾响应：同一重置时刻（实测差 1.3s）旧计数说 100%、比率池说 0%。
+    # 必须取更耗尽的 —— 信 0% 会让人以为还有额度。
+    contradictory = {
+        "limits": [{
+            "window": {"duration": 300, "timeUnit": "TIME_UNIT_MINUTE"},
+            "detail": {"limit": "100", "used": "100",
+                       "resetTime": "2026-10-24T05:55:22.273190Z"},
+        }],
+        "usages": {"limit_5h": {"used_ratio": 0,
+                                "reset_time": "2026-10-24T05:55:21Z"}},
+    }
+    r = parse_kimi(contradictory)
+    check("⚠️ 矛盾读数取更耗尽的一份（100% 不被 0% 覆盖）",
+          r["windows"][0]["used_percent"], 100.0)
+
+    # 重置时刻对不上 = 不是同一个窗口，不借旧计数
+    shifted = json.loads(json.dumps(contradictory))
+    shifted["limits"][0]["detail"]["resetTime"] = "2026-10-24T06:55:22Z"
+    r = parse_kimi(shifted)
+    check("重置时刻对不上时保留比率池读数",
+          r["windows"][0]["used_percent"], 0.0)
+
+    # 脏值：比率 >1 夹到 100%；负数丢弃后走旧计数
+    check("used_ratio > 1 夹到 100%",
+          parse_kimi({"usages": {"limit_5h": {"used_ratio": 1.05}}})
+          ["windows"][0]["used_percent"],
+          100.0)
+    check("used_ratio 为负时不采用（回退旧计数）",
+          parse_kimi({
+              "usages": {"limit_5h": {"used_ratio": -1}},
+              "limits": [{"window": {"duration": 300, "timeUnit": "TIME_UNIT_MINUTE"},
+                          "detail": {"limit": "10", "remaining": "9"}}],
+          })["windows"][0]["used_percent"],
+          10.0)
+
+    # 认不出的窗口时长/单位不猜；全空则失败
+    check("未知时长（60 分钟）不瞎标窗口",
+          parse_kimi({"limits": [
+              {"window": {"duration": 60, "timeUnit": "TIME_UNIT_MINUTE"},
+               "detail": {"limit": "10", "remaining": "5"}},
+          ]})["kind"],
+          "error")
+    check("完全空响应 → 失败而不是空列表", parse_kimi({})["kind"], "error")
+    check("只有空 usages → 失败", parse_kimi({"usages": {}})["kind"], "error")
+
+
 # ------------------------------------------------------------ 实时状态广播
 
 def test_live_status():
-    print("\n[14] 实时状态广播（LiveStatus）")
+    print("\n[15] 实时状态广播（LiveStatus）")
     from http_proxy import LIVE_STATUS_QUIET_SECONDS, LiveStatus
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -985,6 +1097,7 @@ def main():
     test_include_usage_injection()
     test_balance_parsing()
     test_glm_parsing()
+    test_kimi_parsing()
     test_live_status()
 
     print("\n" + "=" * 68)

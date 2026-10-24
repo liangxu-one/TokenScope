@@ -328,6 +328,8 @@ python3 balance.py --min 5       # 货币余额低于 5 则退出码 1，挂 cro
   deepseek    ¥10.73                      —
   minimax     5 小时 已用 1%              2026-08-02 20:00
               7 天   已用 23%             2026-08-03 00:00
+  kimi        5 小时 已用 0%              2026-10-24 13:55
+              月度   已用 55%             2026-11-24 08:00
 ```
 
 `stats_report.py --balance` 会在表头带一行摘要。**不带这个参数就不联网** ——
@@ -372,9 +374,14 @@ python3 balance.py --min 5       # 货币余额低于 5 则退出码 1，挂 cro
 请求**直连上游**，不走本地代理 —— 这不是 LLM 调用，走代理只会往 jsonl 里塞
 无意义的记录。
 
-### 内置只有 DeepSeek、MiniMax 与智谱 GLM
+Kimi 这条用的是 **Kimi Code 订阅**接口（`https://api.kimi.com/coding/v1/usages`，
+国际站是 `api.kimi.ai`），key 从 Kimi Code 控制台签发；Moonshot 开放平台的按量
+余额是另一个接口（`api.moonshot.cn/v1/users/me/balance`，货币余额），拿错 key
+会 401。
 
-刻意只内置这三家：它们是本仓库**实测验证过**的，且正好覆盖两种 `kind`，
+### 内置只有 DeepSeek、MiniMax、智谱 GLM 与 Kimi For Coding
+
+刻意只内置这四家：它们是本仓库**实测验证过**的，且正好覆盖两种 `kind`，
 可以直接当模板照抄。
 
 各家余额接口的字段语义差异极大，凭文档照抄而不实测很容易写出「看起来有数字但
@@ -392,6 +399,15 @@ python3 balance.py --min 5       # 货币余额低于 5 则退出码 1，挂 cro
   显示成「98%」
 - 智谱窗口类型只认 `limits[].unit`（3=5 小时、6=7 天），不能拿重置时间排序
   代替 —— 周期末尾每周窗会比 5 小时窗更早重置，时间排序必然把两桶标反
+- Kimi Code 的 `usages.*.used_ratio` 是 **0~1 的比率**（`0.5531` = 55.31%），
+  不是百分比；且同一个 5 小时窗口在 `limits[]`（旧计数，单位是请求次数）里
+  还有一份读数。两份**可能互相矛盾**（实测过旧计数 100/100、比率池 0%），
+  只有重置时刻一致（≤2s）才合并，并取更耗尽的读数 —— 否则会把「已用 100%」
+  显示成「0%」，让人误以为还有额度
+- Kimi 的月度只认 `limit_month_total`（Total 池），`limit_month_code` 是子池，
+  同时展示只是同一份额度的两个切法
+- 官方 2026 年改版后**新套餐已取消周额度**（只剩滚动 5 小时窗 + 月度总配额），
+  老套餐才保留周额度；`limit_7d` 不出现是新账号的正常形态，不是解析漏了
 
 这些结论都钉进了 `selftest_usage.py` 的断言。
 
@@ -435,7 +451,7 @@ def parse_myvendor(payload):                    # 与网络分离，便于不联
 > `api.deepseek.com@evil.example`（userinfo 冒充，真实主机是 `@` 之后那段）、
 > `evil.example/?upstream=api.deepseek.com`（塞在 query 里）。
 >
-> 内置三家的额度 URL 是写死的，判错只是显示不对；但你的实现若按 `base_url`
+> 内置提供方的额度 URL 是写死的，判错只是显示不对；但你的实现若按 `base_url`
 > 拼请求地址，判错就等于把 key 发到配置里写的任意主机上。要判站点用 `host_of`。
 > 这三种形状都钉在 `selftest_usage.py` 里了。
 >
