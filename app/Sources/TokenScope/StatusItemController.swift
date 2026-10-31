@@ -30,16 +30,21 @@ final class StatusItemController: NSObject, NSPopoverDelegate {
     /// 菜单是常驻对象，不重建，勾选态跟着偏好走
     private let crabItem = NSMenuItem()
 
-    /// 关掉小螃蟹后回到的原版图标：SF Symbol 闪电，模板图 + contentTintColor
-    /// 染成黄色 —— 与 MenuBarExtra 时代的
+    /// 关掉小螃蟹后回到的原版图标：SF Symbol 闪电，黄色**直接烘进图里**，
+    /// 与 MenuBarExtra 时代的
     /// `Image(systemName: "bolt.fill").foregroundStyle(.yellow)` 同一观感
     /// （SwiftUI 的 `.yellow` 在 macOS 上就是 systemYellow）。
+    ///
+    /// ⚠️ 别改回「模板图 + contentTintColor = .systemYellow」那套：模板图由
+    /// 系统按菜单栏前景色着色，2026-10-31 在 macOS 27 上实测就是个黑闪电
+    /// （contentTintColor 被无视）。palette 着色 + 非模板图才跟外观解耦。
     private static let boltImage: NSImage = {
         let symbol = NSImage(systemSymbolName: "bolt.fill", accessibilityDescription: "TokenScope")!
         let configured = symbol.withSymbolConfiguration(
             NSImage.SymbolConfiguration(pointSize: 14, weight: .semibold)
+                .applying(NSImage.SymbolConfiguration(paletteColors: [.systemYellow]))
         )!
-        configured.isTemplate = true
+        configured.isTemplate = false
         return configured
     }()
 
@@ -108,7 +113,8 @@ final class StatusItemController: NSObject, NSPopoverDelegate {
         // 停掉并清零状态，这里只管图标长相
         guard RobotMonitor.isEnabled else {
             button.image = Self.boltImage
-            button.contentTintColor = .systemYellow
+            // 非模板图自带黄色，不要再上 tint（对非模板图也无效）
+            button.contentTintColor = nil
             button.title = ""
             return
         }
