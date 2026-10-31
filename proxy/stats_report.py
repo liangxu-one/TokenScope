@@ -108,15 +108,6 @@ class Bucket:
     def total_tokens(self):
         return self.total_input + self.output
 
-    @property
-    def billable_tokens(self):
-        """
-        计费口径的 token 量（缓存读取便宜、写入偏贵）。
-        倍率取 new-api 的默认值：读 0.1，写 1.25（setting/ratio_setting/cache_ratio.go）。
-        仅用于横向对比成本量级，不等于真实账单。
-        """
-        return self.new_input + self.cached * 0.1 + self.cache_creation * 1.25 + self.output
-
     def percentile(self, values, p):
         if not values:
             return 0
@@ -227,7 +218,6 @@ def main():
   ─────────────────────────
   真实总输入    {fmt(total.total_input):>12}   （新增 + 缓存读 + 缓存写）
   总 token      {fmt(total.total_tokens):>12}
-  计费等效      {fmt(total.billable_tokens):>12}   （缓存读×0.1 + 缓存写×1.25）
 
   缓存命中率    {total.cache_hit_rate:>11.2f}%   = Σ{fmt(total.cached)} / Σ{fmt(total.hit_rate_denominator)}
                              （先汇总再相除，分母为真实总输入）""")

@@ -96,17 +96,12 @@ struct ContentView: View {
     private var header: some View {
         HStack(alignment: .top) {
             VStack(alignment: .leading, spacing: 4) {
-                Text("今日真实消耗 Tokens")
+                Text("今日总 Tokens")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    Text(formatNumber(viewModel.summary.realConsumedTokens))
-                        .font(.system(size: 30, weight: .bold, design: .rounded))
-                    Text("不含缓存读取")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                }
-                Text("总 token \(formatTokenCount(viewModel.summary.totalTokens))　·　计费等效 \(formatTokenCount(Int64(viewModel.summary.billableTokens)))")
+                Text(formatNumber(viewModel.summary.totalTokens))
+                    .font(.system(size: 30, weight: .bold, design: .rounded))
+                Text("真实消耗 \(formatNumber(viewModel.summary.realConsumedTokens))（不含缓存读取）")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
@@ -612,7 +607,6 @@ struct RobotBannerView: View {
             输出 \(formatNumber(row.outputTokens))
             真实总输入 \(formatNumber(row.totalInputTokens))
             命中率 \(formatNumber(row.cachedTokens)) / \(formatNumber(row.hitRateDenominator)) = \(String(format: "%.2f%%", row.cacheHitRate))
-            计费等效 \(formatNumber(Int64(row.billableTokens)))
             首字 P50 \(formatDuration(row.ttftP50))　耗时 P50 \(formatDuration(row.durationP50))
             """)
     }

@@ -123,16 +123,6 @@ struct TokenAggregate {
             : 0
     }
 
-    /// 计费等效 token。倍率取 new-api 默认值
-    /// （`setting/ratio_setting/cache_ratio.go`：缓存读 0.1、缓存写 1.25）。
-    /// 仅用于横向比较成本量级，不等于真实账单。
-    var billableTokens: Double {
-        Double(newInputTokens)
-            + Double(cachedTokens) * 0.1
-            + Double(cacheCreationTokens) * 1.25
-            + Double(outputTokens)
-    }
-
     func percentile(_ values: [Int], _ p: Double) -> Int {
         guard !values.isEmpty else { return 0 }
         let sorted = values.sorted()
@@ -165,7 +155,6 @@ struct StatsRow: Identifiable {
     let totalInputTokens: Int64
     let totalTokens: Int64
     let cacheHitRate: Double
-    let billableTokens: Double
 
     let ttftP50: Int
     let durationP50: Int
@@ -183,7 +172,6 @@ struct StatsRow: Identifiable {
         self.totalInputTokens = aggregate.totalInputTokens
         self.totalTokens = aggregate.totalTokens
         self.cacheHitRate = aggregate.cacheHitRate
-        self.billableTokens = aggregate.billableTokens
         self.ttftP50 = aggregate.ttftP50
         self.durationP50 = aggregate.durationP50
     }
@@ -192,7 +180,7 @@ struct StatsRow: Identifiable {
 /// 趋势图用的单个小时数据点。
 ///
 /// 只带四项 token 总量 —— 图表不看延迟分位数，所以不复用 `StatsRow`
-/// （那个还要拖上 P50、命中率、计费等效等一堆字段）。
+/// （那个还要拖上 P50、命中率等一堆字段）。
 struct HourlyPoint: Identifiable {
     let hour: Int
     var id: Int { hour }
@@ -230,7 +218,6 @@ struct TodaySummary {
     var totalInputTokens: Int64 = 0
     var totalTokens: Int64 = 0
     var cacheHitRate: Double = 0
-    var billableTokens: Double = 0
 
     var ttftP50 = 0
     var ttftP95 = 0
@@ -252,7 +239,6 @@ struct TodaySummary {
         totalInputTokens = aggregate.totalInputTokens
         totalTokens = aggregate.totalTokens
         cacheHitRate = aggregate.cacheHitRate
-        billableTokens = aggregate.billableTokens
         ttftP50 = aggregate.ttftP50
         ttftP95 = aggregate.ttftP95
         durationP50 = aggregate.durationP50
