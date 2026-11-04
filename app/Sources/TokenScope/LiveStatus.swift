@@ -42,20 +42,22 @@ struct LiveStatusSnapshot: Codable {
 
 /// 判定语义的常量。
 ///
-/// ⚠️ 必须与 `proxy/http_proxy.py` 顶部的同名常量一致 —— 两边是同一份契约的
-/// 两端，改一边就要改另一边。Python 侧已有 selftest 钉住自己的那份。
+/// ⚠️ 与 `proxy/http_proxy.py` 的 `LIVE_STATUS_QUIET_SECONDS` **故意不同**（3 vs 15），
+/// 两者管的不是同一件事，别再「对齐」它们：
+/// - 代理侧 15 秒：判定「这一轮算不算延续」，决定 `turn_start` 要不要重置成新回合；
+/// - app 侧 3 秒：只管 UI 尾巴 —— 响应结束后最多再显示几秒的爬行与计时。
+/// 2026-11-04 用户要求「话说完就停」：15 秒尾巴太长，3 秒内没有新请求就停。
 enum LiveStatusSemantics {
-    /// 回合的安静窗口。代理侧请求间隙短于它仍算同一回合；
-    /// app 侧用它识别「回合尾巴」：最后一次活动过去没超过它，机器人继续忙
-    /// （覆盖「工具在本地执行、下一个请求马上就来」的间隙 —— 代理看不到
-    /// 没有网络流量的阶段，只能靠时间窗口去猜）。
-    /// 与 `LIVE_STATUS_QUIET_SECONDS` 一致。
-    static let quietSeconds: TimeInterval = 15
+    /// UI 尾巴。最后一次活动过去没超过它，机器人继续爬、计时继续走；
+    /// 超过就当作「这一轮已经说完」，螃蟹停住、菜单栏数字清空。
+    /// 刻意比代理侧的回合窗口短得多：中间工具执行的间隙由代理去算，
+    /// UI 不陪它等满 15 秒（代价是 10 秒后再来的请求会让数字从中断处「复活」）。
+    static let quietSeconds: TimeInterval = 3
 
-    /// 文件过旧即视为代理失联。只比安静窗口多 5 秒余量：忙碌期间代理有
-    /// 5 秒一次的心跳兜底（见 `LIVE_STATUS_HEARTBEAT_SECONDS`），正常情况
-    /// 文件年龄不会超过心跳间隔；超过 20 秒还带着 in_flight > 0，只能是
-    /// 代理崩了 —— 机器人必须睡，不能永远「忙」下去。
+    /// 文件过旧即视为代理失联。与 quietSeconds 无关，配对的是代理的
+    /// 5 秒心跳（见 `LIVE_STATUS_HEARTBEAT_SECONDS`）：忙碌期间文件年龄正常
+    /// 不会超过心跳间隔，超过 20 秒还带着 in_flight > 0，只能是代理崩了 ——
+    /// 机器人必须睡，不能永远「忙」下去。
     static let staleSeconds: TimeInterval = 20
 }
 
